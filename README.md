@@ -21,13 +21,24 @@ python process_data.py
 ```
 生成文件: `processed_power_data.csv`
 
-### 3. 训练模型
+### 3. 数据分析 (可选但推荐)
+```bash
+# 基础可视化
+python visualize_data.py
+# 生成: power_data_visualization.png
+
+# 深度模式分析
+python analyze_patterns.py
+# 生成: pattern_analysis.png (6张分析图表)
+```
+
+### 4. 训练模型
 ```bash
 python improved_train.py
 ```
 生成文件: `improved_power_model.json`, `improved_model_results.png`
 
-### 4. 使用模型预测
+### 5. 使用模型预测
 ```python
 import xgboost as xgb
 import pandas as pd
@@ -47,6 +58,10 @@ predictions = model.predict(X_new)
 | `772_2024-06-*.json` | 原始数据 (6天) |
 | `process_data.py` | 数据处理脚本 |
 | `processed_power_data.csv` | 处理后的数据 |
+| `visualize_data.py` | 数据可视化脚本 |
+| `power_data_visualization.png` | 数据分析图表 |
+| `analyze_patterns.py` | 深度模式分析脚本 |
+| `pattern_analysis.png` | 6张深度分析图表 |
 | `improved_train.py` | 训练脚本 ⭐ |
 | `improved_power_model.json` | 训练好的模型 ⭐ |
 | `improved_model_results.png` | 模型效果图 |
