@@ -228,6 +228,36 @@ def calculate_acc_(y_actual, y_pred):
 
     return acc_ * 100  # 转换为百分比
 
+def calculate_acc_mae(y_actual, y_pred):
+    """计算基于MAE的ACC指标
+
+    ACC_MAE = 1 - (1/N * sum(|P_M_i - P_P_i| / P_M_i))
+
+    忽略真实值为0的样本
+    """
+    # 展平数组
+    y_actual_flat = y_actual.flatten()
+    y_pred_flat = y_pred.flatten()
+
+    # 过滤掉真实值为0的样本
+    mask = y_actual_flat != 0
+    y_actual_nonzero = y_actual_flat[mask]
+    y_pred_nonzero = y_pred_flat[mask]
+
+    if len(y_actual_nonzero) == 0:
+        return 0.0  # 如果所有值都是0，返回0
+
+    # 计算相对误差的绝对值
+    relative_errors = np.abs((y_actual_nonzero - y_pred_nonzero) / y_actual_nonzero)
+
+    # 计算平均绝对相对误差
+    mae_relative = np.mean(relative_errors)
+
+    # 计算ACC_MAE
+    acc_mae = 1 - mae_relative
+
+    return acc_mae * 100  # 转换为百分比
+
 def evaluate_model(model, X_train, y_train, X_val, y_val, y_scaler):
     """评估模型"""
     print("\n" + "="*60)
@@ -243,6 +273,7 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, y_scaler):
     train_rmse = np.sqrt(mean_squared_error(y_train_actual, y_train_pred))
     train_r2 = r2_score(y_train_actual, y_train_pred)
     train_acc_ = calculate_acc_(y_train_actual, y_train_pred)
+    train_acc_mae = calculate_acc_mae(y_train_actual, y_train_pred)
 
     print("\n训练集:")
     print(f"  MAE:  {train_mae:.2f} W")
@@ -254,6 +285,7 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, y_scaler):
     train_accuracy = 100 - train_relative_error
     print(f"  准确率: {train_accuracy:.2f}%")
     print(f"  ACC_:  {train_acc_:.2f}%")
+    print(f"  ACC_MAE: {train_acc_mae:.2f}%")
 
     # 验证集预测
     y_val_pred_scaled = model.predict(X_val, verbose=0)
@@ -264,6 +296,7 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, y_scaler):
     val_rmse = np.sqrt(mean_squared_error(y_val_actual, y_val_pred))
     val_r2 = r2_score(y_val_actual, y_val_pred)
     val_acc_ = calculate_acc_(y_val_actual, y_val_pred)
+    val_acc_mae = calculate_acc_mae(y_val_actual, y_val_pred)
 
     print("\n验证集:")
     print(f"  MAE:  {val_mae:.2f} W")
@@ -275,6 +308,7 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, y_scaler):
     val_accuracy = 100 - val_relative_error
     print(f"  准确率: {val_accuracy:.2f}%")
     print(f"  ACC_:  {val_acc_:.2f}%")
+    print(f"  ACC_MAE: {val_acc_mae:.2f}%")
 
     # 计算每个时间步的误差（验证集）
     print("\n验证集各时间步误差分析:")
@@ -287,6 +321,7 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, y_scaler):
     print("\n" + "="*60)
     print(f"最终验证集准确率: {val_accuracy:.2f}%")
     print(f"最终验证集ACC_: {val_acc_:.2f}%")
+    print(f"最终验证集ACC_MAE: {val_acc_mae:.2f}%")
     print(f"最终验证集误差率: {val_relative_error:.2f}%")
     print("="*60)
 
