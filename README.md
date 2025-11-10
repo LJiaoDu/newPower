@@ -144,29 +144,89 @@ python visualize_data.py
 - 收集更多天数的数据以捕捉更长期的模式
 - 考虑加入外部变量(天气、季节等)
 
+## 模型训练
+
+### 训练脚本
+使用 `example_train.py` 进行模型训练:
+```bash
+python example_train.py
+```
+
+### 模型特点
+1. **特征工程**:
+   - 滞后特征: 前12个时间步(1小时)的功率值
+   - 滚动窗口特征: 30分钟和1小时的平均值及标准差
+   - 时间特征: 年、月、日、小时、分钟、星期几等
+
+2. **模型架构**:
+   - 使用 XGBoost 回归模型
+   - 100棵决策树,最大深度6
+   - 学习率0.1
+
+3. **数据划分**:
+   - 训练集: 80% (1,275样本)
+   - 测试集: 20% (319样本)
+   - 按时间顺序划分(不打乱)
+
+### 模型性能
+
+训练集表现:
+- MAE (平均绝对误差): 109.87 W
+- RMSE (均方根误差): 189.84 W
+- R² 决定系数: 0.9995
+
+测试集表现:
+- MAE (平均绝对误差): 651.07 W
+- RMSE (均方根误差): 1370.00 W
+- R² 决定系数: 0.9303
+- 相对误差: 16.79%
+
+### 模型文件
+- `power_prediction_model.json`: 训练好的XGBoost模型
+- `prediction_results.png`: 预测结果对比图
+- `feature_importance.png`: 特征重要性分析
+
+### 模型使用示例
+```python
+import xgboost as xgb
+import pandas as pd
+
+# 加载模型
+model = xgb.XGBRegressor()
+model.load_model('power_prediction_model.json')
+
+# 准备预测数据(需要包含所有特征)
+# 假设 X_new 是准备好的特征数据
+predictions = model.predict(X_new)
+```
+
 ## 依赖库
 
 ```bash
-pip install pandas numpy matplotlib
+pip install pandas numpy matplotlib scikit-learn xgboost
 ```
 
 ## 文件结构
 
 ```
 newPower/
-├── 772_2024-06-01.json          # 原始数据
+├── 772_2024-06-01.json               # 原始数据
 ├── 772_2024-06-02.json
 ├── 772_2024-06-03.json
 ├── 772_2024-06-04.json
 ├── 772_2024-06-05.json
 ├── 772_2024-06-06.json
-├── process_data.py               # 数据处理脚本
-├── visualize_data.py             # 可视化脚本
-├── simple_power_data.csv         # 简化数据
-├── processed_power_data.csv      # 完整数据
-├── training_data.csv             # 训练数据(与processed相同)
-├── power_data_visualization.png  # 可视化结果
-└── README.md                     # 本文档
+├── process_data.py                   # 数据处理脚本
+├── visualize_data.py                 # 可视化脚本
+├── example_train.py                  # 模型训练示例脚本
+├── simple_power_data.csv             # 简化数据
+├── processed_power_data.csv          # 完整数据
+├── training_data.csv                 # 训练数据(与processed相同)
+├── power_data_visualization.png      # 数据可视化结果
+├── power_prediction_model.json       # 训练好的模型
+├── prediction_results.png            # 预测结果图
+├── feature_importance.png            # 特征重要性图
+└── README.md                         # 本文档
 ```
 
 ## 许可证
