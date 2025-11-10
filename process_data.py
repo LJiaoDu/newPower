@@ -3,6 +3,34 @@ import pandas as pd
 from datetime import datetime, timedelta
 import os
 
+def fix_timestamp_format(data, filename):
+    """检查并修复时间戳格式
+
+    如果时间戳是秒级(10位)，自动转换为毫秒级(13位)
+    """
+    fixed = False
+
+    # 修复功率列表中的时间戳
+    power_list = data.get('stationStatisticPowerList', [])
+
+    for item in power_list:
+        if 'dateTime' in item:
+            old_time = item['dateTime']
+            # 如果小于2000000000（约2033-05-18的秒级时间戳），说明是秒级
+            if old_time < 2000000000:
+                item['dateTime'] = old_time * 1000
+                fixed = True
+
+        if 'updateTime' in item:
+            old_time = item['updateTime']
+            if old_time < 2000000000:
+                item['updateTime'] = old_time * 1000
+
+    if fixed:
+        print(f"  ⚠️  检测到秒级时间戳，已自动转换为毫秒级")
+
+    return data
+
 def load_json_files(directory):
     """加载所有JSON文件并提取功率数据"""
     all_data = []
@@ -17,6 +45,9 @@ def load_json_files(directory):
 
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
+
+        # 检查并修复时间戳格式
+        data = fix_timestamp_format(data, filename)
 
         # 提取功率列表数据
         power_list = data.get('stationStatisticPowerList', [])
