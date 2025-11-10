@@ -9,6 +9,7 @@
 *.pyc
 __pycache__/
 .DS_Store
+*.log
 
 # 忽略重复的CSV文件
 simple_power_data.csv
