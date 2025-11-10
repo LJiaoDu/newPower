@@ -18,6 +18,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard
 import pickle
 import os
+from tqdm.keras import TqdmCallback
 
 # 配置参数
 LOOKBACK_HOURS = 20      # 输入：过去20小时
@@ -179,7 +180,9 @@ def train_model(model, X_train, y_train, X_val, y_val):
             patience=5,
             min_lr=0.00001,
             verbose=1
-        )
+        ),
+        # tqdm进度条
+        TqdmCallback(verbose=2)
     ]
 
     # 训练
@@ -190,7 +193,7 @@ def train_model(model, X_train, y_train, X_val, y_val):
         epochs=100,
         batch_size=32,
         callbacks=callbacks,
-        verbose=1
+        verbose=0  # 关闭Keras默认进度条，使用tqdm
     )
 
     print("✓ 模型训练完成")
