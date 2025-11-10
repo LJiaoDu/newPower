@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use('Agg')
 import xgboost as xgb
 import pickle
+from tqdm import tqdm
 
 # 配置参数
 LOOKBACK_HOURS = 20      # 输入：过去20小时
@@ -136,14 +137,25 @@ def train_model(X_train, y_train):
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=42,
-        n_jobs=-1
+        n_jobs=1,  # 每个estimator单线程，让MultiOutputRegressor并行
+        verbosity=0  # 关闭XGBoost自己的输出
     )
 
     # 使用MultiOutputRegressor支持多输出
     model = MultiOutputRegressor(base_model, n_jobs=-1)
 
-    print("开始训练（预测48个未来时间点）...")
-    model.fit(X_train, y_train)
+    print(f"开始训练（预测{FORECAST_POINTS}个未来时间点）...")
+    print(f"将训练 {FORECAST_POINTS} 个独立的XGBoost模型...")
+
+    # 手动训练每个输出，显示进度条
+    from sklearn.base import clone
+    model.estimators_ = []
+
+    for i in tqdm(range(y_train.shape[1]), desc="训练进度", unit="模型"):
+        estimator = clone(base_model)
+        estimator.fit(X_train, y_train[:, i])
+        model.estimators_.append(estimator)
+
     print("✓ 模型训练完成")
 
     return model
