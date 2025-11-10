@@ -7,7 +7,9 @@ def load_json_files(directory):
     """加载所有JSON文件并提取功率数据"""
     all_data = []
 
-    json_files = sorted([f for f in os.listdir(directory) if f.endswith('.json')])
+    # 只加载数据文件，跳过模型文件
+    json_files = sorted([f for f in os.listdir(directory)
+                        if f.endswith('.json') and f.startswith('772_')])
 
     for filename in json_files:
         filepath = os.path.join(directory, filename)
