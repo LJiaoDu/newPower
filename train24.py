@@ -27,19 +27,32 @@ def load_data():
     print("="*60)
     print("加载数据...")
     print("="*60)
-    df = pd.read_csv('/home/user/newPower/processed_power_data.csv')
+    df = pd.read_csv('/home/user/newPower/training_data.csv')
     df['datetime'] = pd.to_datetime(df['datetime'])
     print(f"总数据点: {len(df)}")
     print(f"时间范围: {df['datetime'].min()} 到 {df['datetime'].max()}")
     return df
 
-def create_sequences(df):
+def split_raw_data(df, train_ratio=0.8):
+    """先将原始数据按时间顺序划分为训练集和验证集"""
+    print("\n划分原始数据集...")
+    split_idx = int(len(df) * train_ratio)
+
+    df_train = df[:split_idx].copy()
+    df_val = df[split_idx:].copy()
+
+    print(f"训练集原始数据: {len(df_train)} 点 ({df_train['datetime'].min()} 到 {df_train['datetime'].max()})")
+    print(f"验证集原始数据: {len(df_val)} 点 ({df_val['datetime'].min()} 到 {df_val['datetime'].max()})")
+
+    return df_train, df_val
+
+def create_sequences(df, dataset_name="训练"):
     """创建序列数据
 
     输入：过去20小时（240个点）
     输出：未来4小时（48个点）
     """
-    print("\n创建训练序列...")
+    print(f"\n创建{dataset_name}序列...")
     print(f"输入窗口: {LOOKBACK_HOURS}小时 ({LOOKBACK_POINTS}个点)")
     print(f"输出窗口: {FORECAST_HOURS}小时 ({FORECAST_POINTS}个点)")
 
@@ -99,7 +112,7 @@ def create_sequences(df):
     X = np.array(X)
     y = np.array(y)
 
-    print(f"\n生成样本数: {len(X)}")
+    print(f"生成样本数: {len(X)}")
     print(f"输入特征维度: {X.shape[1]}")
     print(f"  - 历史功率点: {LOOKBACK_POINTS}")
     print(f"  - 统计特征: 8")
@@ -107,20 +120,6 @@ def create_sequences(df):
     print(f"输出维度: {y.shape[1]} (未来{FORECAST_HOURS}小时)")
 
     return X, y, np.array(timestamps)
-
-def split_data(X, y, timestamps, train_ratio=0.8):
-    """划分训练集和测试集"""
-    print("\n划分数据集...")
-    split_idx = int(len(X) * train_ratio)
-
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-    ts_train, ts_test = timestamps[:split_idx], timestamps[split_idx:]
-
-    print(f"训练集: {len(X_train)} 样本")
-    print(f"测试集: {len(X_test)} 样本")
-
-    return X_train, X_test, y_train, y_test, ts_train, ts_test
 
 def train_model(X_train, y_train):
     """训练多输出XGBoost模型"""
@@ -149,7 +148,7 @@ def train_model(X_train, y_train):
 
     return model
 
-def evaluate_model(model, X_train, y_train, X_test, y_test):
+def evaluate_model(model, X_train, y_train, X_val, y_val):
     """评估模型"""
     print("\n" + "="*60)
     print("模型评估")
@@ -166,33 +165,41 @@ def evaluate_model(model, X_train, y_train, X_test, y_test):
     print(f"  RMSE: {train_rmse:.2f} W")
     print(f"  R²:   {train_r2:.4f}")
 
-    # 测试集预测
-    y_test_pred = model.predict(X_test)
-    test_mae = mean_absolute_error(y_test, y_test_pred)
-    test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
-    test_r2 = r2_score(y_test, y_test_pred)
+    mean_power_train = y_train.mean()
+    train_relative_error = (train_mae / mean_power_train) * 100
+    train_accuracy = 100 - train_relative_error
+    print(f"  准确率: {train_accuracy:.2f}%")
 
-    print("\n测试集:")
-    print(f"  MAE:  {test_mae:.2f} W")
-    print(f"  RMSE: {test_rmse:.2f} W")
-    print(f"  R²:   {test_r2:.4f}")
+    # 验证集预测
+    y_val_pred = model.predict(X_val)
+    val_mae = mean_absolute_error(y_val, y_val_pred)
+    val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
+    val_r2 = r2_score(y_val, y_val_pred)
 
-    # 计算每个时间步的误差
-    print("\n各时间步误差分析:")
-    timestep_mae = np.mean(np.abs(y_test - y_test_pred), axis=0)
+    print("\n验证集:")
+    print(f"  MAE:  {val_mae:.2f} W")
+    print(f"  RMSE: {val_rmse:.2f} W")
+    print(f"  R²:   {val_r2:.4f}")
+
+    mean_power_val = y_val.mean()
+    val_relative_error = (val_mae / mean_power_val) * 100
+    val_accuracy = 100 - val_relative_error
+    print(f"  准确率: {val_accuracy:.2f}%")
+
+    # 计算每个时间步的误差（验证集）
+    print("\n验证集各时间步误差分析:")
+    timestep_mae = np.mean(np.abs(y_val - y_val_pred), axis=0)
 
     for hour in [1, 2, 3, 4]:
         idx = hour * 12 - 1  # 每小时的最后一个点
         print(f"  未来第{hour}小时末: MAE = {timestep_mae[idx]:.2f} W")
 
-    mean_power = y_test.mean()
-    relative_error = (test_mae / mean_power) * 100
-    accuracy = 100 - relative_error
+    print("\n" + "="*60)
+    print(f"最终验证集准确率: {val_accuracy:.2f}%")
+    print(f"最终验证集误差率: {val_relative_error:.2f}%")
+    print("="*60)
 
-    print(f"\n整体预测准确率: {accuracy:.2f}%")
-    print(f"相对误差: {relative_error:.2f}%")
-
-    return y_test_pred
+    return y_val_pred
 
 def plot_results(y_test, y_pred, timestamps):
     """可视化预测结果"""
@@ -273,25 +280,33 @@ def save_model(model):
 def main():
     print("="*60)
     print("20小时历史数据 → 4小时功率预测模型")
+    print("使用 training_data.csv，按 80/20 划分训练/验证集")
     print("="*60)
 
     # 1. 加载数据
     df = load_data()
 
-    # 2. 创建序列
-    X, y, timestamps = create_sequences(df)
+    # 2. 先划分原始数据（80% 训练，20% 验证）
+    df_train, df_val = split_raw_data(df, train_ratio=0.8)
 
-    # 3. 划分数据
-    X_train, X_test, y_train, y_test, ts_train, ts_test = split_data(X, y, timestamps)
+    # 3. 分别创建训练集和验证集的序列
+    X_train, y_train, ts_train = create_sequences(df_train, dataset_name="训练集")
+    X_val, y_val, ts_val = create_sequences(df_val, dataset_name="验证集")
+
+    print("\n" + "="*60)
+    print(f"最终样本统计:")
+    print(f"  训练样本: {len(X_train)}")
+    print(f"  验证样本: {len(X_val)}")
+    print("="*60)
 
     # 4. 训练模型
     model = train_model(X_train, y_train)
 
     # 5. 评估模型
-    y_pred = evaluate_model(model, X_train, y_train, X_test, y_test)
+    y_pred = evaluate_model(model, X_train, y_train, X_val, y_val)
 
     # 6. 可视化
-    plot_results(y_test, y_pred, ts_test)
+    plot_results(y_val, y_pred, ts_val)
 
     # 7. 保存模型
     save_model(model)
