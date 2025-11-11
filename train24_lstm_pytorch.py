@@ -96,6 +96,14 @@ class LSTMPowerPredictor(pl.LightningModule):
 
         return loss
 
+    def on_train_epoch_end(self):
+        """训练阶段结束时打印平均指标"""
+        train_loss = self.trainer.callback_metrics.get('train_loss_epoch', 0)
+        train_mae = self.trainer.callback_metrics.get('train_mae_epoch', 0)
+
+        print(f"\n[训练完成] Epoch {self.current_epoch + 1}: "
+              f"train_loss={train_loss:.4f}, train_mae={train_mae:.4f}")
+
     def validation_step(self, batch, batch_idx):
         X, y = batch
         y_pred = self(X)
@@ -112,6 +120,7 @@ class LSTMPowerPredictor(pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
+        """验证阶段结束时打印所有指标"""
         if len(self.validation_step_outputs) == 0:
             return
 
@@ -127,6 +136,15 @@ class LSTMPowerPredictor(pl.LightningModule):
 
         self.log('val_acc_', acc_, prog_bar=True, logger=True)
         self.log('val_acc_mae', acc_mae, prog_bar=True, logger=True)
+
+        # 获取验证阶段的平均loss和mae
+        val_loss = self.trainer.callback_metrics.get('val_loss_epoch', 0)
+        val_mae = self.trainer.callback_metrics.get('val_mae_epoch', 0)
+
+        # 打印完整的验证总结
+        print(f"[验证完成] Epoch {self.current_epoch + 1}: "
+              f"val_loss={val_loss:.4f}, val_mae={val_mae:.4f}, "
+              f"ACC_={acc_:.2f}%, ACC_MAE={acc_mae:.2f}%\n")
 
         self.validation_step_outputs.clear()
         self.validation_step_targets.clear()
