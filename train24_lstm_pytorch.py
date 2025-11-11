@@ -1,22 +1,25 @@
+"""
+纯PyTorch版本：20小时历史数据预测未来4小时功率
+手动训练循环 + tqdm进度条
+"""
+
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
 import pickle
 import os
 import argparse
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
-from pytorch_lightning.callbacks import TQDMProgressBar
 
 torch.set_float32_matmul_precision('high')
+
 
 class PowerDataset(Dataset):
     """电力数据集"""
@@ -31,17 +34,11 @@ class PowerDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-class LSTMPowerPredictor(pl.LightningModule):
+class LSTMPowerPredictor(nn.Module):
+    """LSTM电力预测模型"""
 
-
-    def __init__(self, args, y_scaler=None, output_size=48):
+    def __init__(self, args, output_size=48):
         super().__init__()
-
-        self.save_hyperparameters(ignore=['y_scaler', 'args'])
-        self.y_scaler = y_scaler
-        self.args = args
-        self.output_size = output_size
-
 
         self.lstm1 = nn.LSTM(
             input_size=1,
@@ -64,10 +61,7 @@ class LSTMPowerPredictor(pl.LightningModule):
         self.fc1 = nn.Linear(args.lstm2_hidden * 2, args.fc1_hidden)
         self.dropout3 = nn.Dropout(args.dropout)
         self.fc2 = nn.Linear(args.fc1_hidden, args.fc2_hidden)
-        self.fc3 = nn.Linear(args.fc2_hidden, self.output_size)
-
-        self.validation_step_outputs = []
-        self.validation_step_targets = []
+        self.fc3 = nn.Linear(args.fc2_hidden, output_size)
 
     def forward(self, x):
         x, _ = self.lstm1(x)
@@ -84,128 +78,123 @@ class LSTMPowerPredictor(pl.LightningModule):
 
         return x
 
-    def training_step(self, batch, batch_idx):
-        X, y = batch
-        y_pred = self(X)
 
-        loss = nn.functional.mse_loss(y_pred, y)
+def calculate_acc_(y_actual, y_pred):
+    """计算ACC_指标（基于RMSE）"""
+    y_actual_flat = y_actual.flatten()
+    y_pred_flat = y_pred.flatten()
+    mask = y_actual_flat != 0
+    y_actual_nonzero = y_actual_flat[mask]
+    y_pred_nonzero = y_pred_flat[mask]
+
+    if len(y_actual_nonzero) == 0:
+        return 0.0
+
+    relative_errors = (y_actual_nonzero - y_pred_nonzero) / y_actual_nonzero
+    squared_errors = relative_errors ** 2
+    rmse_relative = np.sqrt(np.mean(squared_errors))
+    acc_ = 1 - rmse_relative
+
+    return acc_ * 100
+
+
+def calculate_acc_mae(y_actual, y_pred):
+    """计算ACC_MAE指标（基于MAE）"""
+    y_actual_flat = y_actual.flatten()
+    y_pred_flat = y_pred.flatten()
+    mask = y_actual_flat != 0
+    y_actual_nonzero = y_actual_flat[mask]
+    y_pred_nonzero = y_pred_flat[mask]
+
+    if len(y_actual_nonzero) == 0:
+        return 0.0
+
+    relative_errors = np.abs((y_actual_nonzero - y_pred_nonzero) / y_actual_nonzero)
+    mae_relative = np.mean(relative_errors)
+    acc_mae = 1 - mae_relative
+
+    return acc_mae * 100
+
+
+def train_one_epoch(model, train_loader, optimizer, criterion, device):
+    """训练一个epoch"""
+    model.train()
+
+    train_losses = []
+    train_maes = []
+
+    pbar = tqdm(train_loader, desc='训练', ncols=100)
+    for X, y in pbar:
+        X, y = X.to(device), y.to(device)
+
+        optimizer.zero_grad()
+        y_pred = model(X)
+
+        loss = criterion(y_pred, y)
         mae = torch.mean(torch.abs(y_pred - y))
 
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train_mae', mae, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        loss.backward()
+        optimizer.step()
 
-        return loss
+        train_losses.append(loss.item())
+        train_maes.append(mae.item())
 
-    def on_train_epoch_end(self):
-        """训练阶段结束时打印平均指标"""
-        train_loss = self.trainer.callback_metrics.get('train_loss_epoch', 0)
-        train_mae = self.trainer.callback_metrics.get('train_mae_epoch', 0)
+        # 更新进度条显示
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-        print(f"\n[训练完成] Epoch {self.current_epoch + 1}: "
-              f"train_loss={train_loss:.4f}, train_mae={train_mae:.4f}")
+    avg_loss = np.mean(train_losses)
+    avg_mae = np.mean(train_maes)
 
-    def validation_step(self, batch, batch_idx):
-        X, y = batch
-        y_pred = self(X)
+    return avg_loss, avg_mae
 
-        loss = nn.functional.mse_loss(y_pred, y)
-        mae = torch.mean(torch.abs(y_pred - y))
 
-        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('val_mae', mae, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+def validate(model, val_loader, criterion, device, y_scaler):
+    """验证模型"""
+    model.eval()
 
-        self.validation_step_outputs.append(y_pred.detach().cpu())
-        self.validation_step_targets.append(y.detach().cpu())
+    val_losses = []
+    val_maes = []
+    all_preds = []
+    all_targets = []
 
-        return loss
+    pbar = tqdm(val_loader, desc='验证', ncols=100)
+    with torch.no_grad():
+        for X, y in pbar:
+            X, y = X.to(device), y.to(device)
 
-    def on_validation_epoch_end(self):
-        """验证阶段结束时打印所有指标"""
-        if len(self.validation_step_outputs) == 0:
-            return
+            y_pred = model(X)
 
-        all_preds = torch.cat(self.validation_step_outputs, dim=0).numpy()
-        all_targets = torch.cat(self.validation_step_targets, dim=0).numpy()
+            loss = criterion(y_pred, y)
+            mae = torch.mean(torch.abs(y_pred - y))
 
-        if self.y_scaler is not None:
-            all_preds = self.y_scaler.inverse_transform(all_preds)
-            all_targets = self.y_scaler.inverse_transform(all_targets)
+            val_losses.append(loss.item())
+            val_maes.append(mae.item())
 
-        acc_ = self.calculate_acc_(all_targets, all_preds)
-        acc_mae = self.calculate_acc_mae(all_targets, all_preds)
+            all_preds.append(y_pred.cpu().numpy())
+            all_targets.append(y.cpu().numpy())
 
-        self.log('val_acc_', acc_, prog_bar=True, logger=True)
-        self.log('val_acc_mae', acc_mae, prog_bar=True, logger=True)
+            # 更新进度条显示
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-        # 获取验证阶段的平均loss和mae
-        val_loss = self.trainer.callback_metrics.get('val_loss_epoch', 0)
-        val_mae = self.trainer.callback_metrics.get('val_mae_epoch', 0)
+    avg_loss = np.mean(val_losses)
+    avg_mae = np.mean(val_maes)
 
-        # 打印完整的验证总结
-        print(f"[验证完成] Epoch {self.current_epoch + 1}: "
-              f"val_loss={val_loss:.4f}, val_mae={val_mae:.4f}, "
-              f"ACC_={acc_:.2f}%, ACC_MAE={acc_mae:.2f}%\n")
+    # 计算ACC指标（在原始尺度上）
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
 
-        self.validation_step_outputs.clear()
-        self.validation_step_targets.clear()
+    if y_scaler is not None:
+        all_preds = y_scaler.inverse_transform(all_preds)
+        all_targets = y_scaler.inverse_transform(all_targets)
 
-    def calculate_acc_(self, y_actual, y_pred):
-        y_actual_flat = y_actual.flatten()
-        y_pred_flat = y_pred.flatten()
-        mask = y_actual_flat != 0
-        y_actual_nonzero = y_actual_flat[mask]
-        y_pred_nonzero = y_pred_flat[mask]
+    acc_ = calculate_acc_(all_targets, all_preds)
+    acc_mae = calculate_acc_mae(all_targets, all_preds)
 
-        if len(y_actual_nonzero) == 0:
-            return 0.0
-
-        relative_errors = (y_actual_nonzero - y_pred_nonzero) / y_actual_nonzero
-        squared_errors = relative_errors ** 2
-        rmse_relative = np.sqrt(np.mean(squared_errors))
-        acc_ = 1 - rmse_relative
-
-        return acc_ * 100
-
-    def calculate_acc_mae(self, y_actual, y_pred):
-        y_actual_flat = y_actual.flatten()
-        y_pred_flat = y_pred.flatten()
-        mask = y_actual_flat != 0
-        y_actual_nonzero = y_actual_flat[mask]
-        y_pred_nonzero = y_pred_flat[mask]
-
-        if len(y_actual_nonzero) == 0:
-            return 0.0
-
-        relative_errors = np.abs((y_actual_nonzero - y_pred_nonzero) / y_actual_nonzero)
-        mae_relative = np.mean(relative_errors)
-        acc_mae = 1 - mae_relative
-
-        return acc_mae * 100
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
-
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=self.args.lr_factor,
-            patience=self.args.lr_patience,
-            min_lr=self.args.lr_min,
-        )
-
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'monitor': 'val_loss',
-                'interval': 'epoch',
-                'frequency': 1
-            }
-        }
+    return avg_loss, avg_mae, acc_, acc_mae
 
 
 def load_data(data_path):
-
+    """加载数据"""
     df = pd.read_csv(data_path)
     df['datetime'] = pd.to_datetime(df['datetime'])
     print(f"总数据点: {len(df)}")
@@ -214,7 +203,7 @@ def load_data(data_path):
 
 
 def split_raw_data(df, train_ratio=0.8):
-
+    """划分原始数据集"""
     split_idx = int(len(df) * train_ratio)
 
     df_train = df[:split_idx].copy()
@@ -226,7 +215,7 @@ def split_raw_data(df, train_ratio=0.8):
 
 
 def create_sequences(df, lookback_points, forecast_points, dataset_name="训练"):
-
+    """创建LSTM序列数据"""
     power_values = df['generationPower'].values
 
     X = []
@@ -250,7 +239,7 @@ def create_sequences(df, lookback_points, forecast_points, dataset_name="训练"
 
 
 def normalize_data(X_train, y_train, X_val, y_val):
-
+    """归一化数据"""
     X_scaler = StandardScaler()
     X_train_scaled = X_train.reshape(-1, 1)
     X_train_scaled = X_scaler.fit_transform(X_train_scaled)
@@ -270,30 +259,44 @@ def normalize_data(X_train, y_train, X_val, y_val):
 
 
 def main(args):
-
-
+    """主函数"""
+    # 设置随机种子
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    if torch.cuda.is_available():
-        print(f" 检测到GPU: {torch.cuda.get_device_name(0)}")
+    # 设置设备
+    if args.device == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    elif args.device == 'gpu':
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
 
+    if torch.cuda.is_available():
+        print(f"检测到GPU: {torch.cuda.get_device_name(0)}")
+    print(f"使用设备: {device}\n")
+
+    # 计算时间点数
     LOOKBACK_POINTS = args.input_hours * 60 // 5
     FORECAST_POINTS = args.pre_hours * 60 // 5
 
+    # 1. 加载数据
     df = load_data(args.data_path)
 
+    # 2. 划分数据集
     df_train, df_val = split_raw_data(df, args.train_ratio)
 
+    # 3. 创建序列
     X_train, y_train = create_sequences(df_train, LOOKBACK_POINTS, FORECAST_POINTS, "训练")
     X_val, y_val = create_sequences(df_val, LOOKBACK_POINTS, FORECAST_POINTS, "验证")
 
-
+    # 4. 归一化
     X_train_scaled, y_train_scaled, X_val_scaled, y_val_scaled, X_scaler, y_scaler = \
         normalize_data(X_train, y_train, X_val, y_val)
 
+    # 5. 创建DataLoader
     train_dataset = PowerDataset(X_train_scaled, y_train_scaled)
     val_dataset = PowerDataset(X_val_scaled, y_val_scaled)
 
@@ -313,58 +316,93 @@ def main(args):
         pin_memory=True if torch.cuda.is_available() else False
     )
 
+    print(f"batch_size: {args.batch_size}")
+    print(f"训练batches: {len(train_loader)}")
+    print(f"验证batches: {len(val_loader)}\n")
 
-    model = LSTMPowerPredictor(args=args, y_scaler=y_scaler, output_size=FORECAST_POINTS)
+    # 6. 创建模型
+    model = LSTMPowerPredictor(args=args, output_size=FORECAST_POINTS)
+    model = model.to(device)
 
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型参数量: {total_params:,}\n")
 
-    callbacks = [
-        EarlyStopping(
-            monitor='val_loss',
-            patience=args.early_stop_patience,
-            mode='min',
-            verbose=True
-        ),
-        ModelCheckpoint(
-            monitor='val_loss',
-            dirpath=args.checkpoint_dir,
-            filename='lstm-{epoch:02d}-{val_loss:.4f}',
-            save_top_k=1,
-            mode='min'
-        ),
-        LearningRateMonitor(logging_interval='epoch'),
-        TQDMProgressBar(refresh_rate=10)
-    ]
-
-
-    if args.device == 'auto':
-        accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
-
-
-    trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        accelerator=accelerator,
-        devices=1,
-        callbacks=callbacks,
-        log_every_n_steps=10,
-        enable_progress_bar=True,
-        deterministic=True,
-        precision=32,
+    # 7. 定义损失函数和优化器
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        min_lr=args.lr_min,
     )
 
+    # 8. 训练循环
+    print("=" * 60)
+    print("开始训练")
+    print("=" * 60)
 
-    ckpt_path = args.resume if args.resume else None
-    trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
+    best_val_loss = float('inf')
+    patience_counter = 0
 
-    print("保存数据归一化器")
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch + 1}/{args.epochs}")
+
+        # 训练阶段
+        train_loss, train_mae = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        print(f"[训练完成] train_loss={train_loss:.4f}, train_mae={train_mae:.4f}")
+
+        # 验证阶段
+        val_loss, val_mae, acc_, acc_mae = validate(model, val_loader, criterion, device, y_scaler)
+        print(f"[验证完成] val_loss={val_loss:.4f}, val_mae={val_mae:.4f}, ACC_={acc_:.2f}%, ACC_MAE={acc_mae:.2f}%")
+
+        # 学习率调度
+        scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+
+            best_model_path = os.path.join(args.checkpoint_dir, f'best_model.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'val_mae': val_mae,
+                'acc_': acc_,
+                'acc_mae': acc_mae,
+            }, best_model_path)
+            print(f"✓ 保存最佳模型 (val_loss={val_loss:.4f})")
+        else:
+            patience_counter += 1
+            print(f"早停计数: {patience_counter}/{args.early_stop_patience}")
+
+        # 早停
+        if patience_counter >= args.early_stop_patience:
+            print(f"\n早停触发！已经{args.early_stop_patience}个epoch没有改进")
+            break
+
+    # 9. 保存scaler
+    print("\n" + "=" * 60)
+    print("训练完成！")
+    print("=" * 60)
+    print(f"最佳验证loss: {best_val_loss:.4f}")
+
+    print("\n保存数据归一化器...")
     with open('scalers_pytorch.pkl', 'wb') as f:
         pickle.dump({'X_scaler': X_scaler, 'y_scaler': y_scaler}, f)
     print("已保存到 scalers_pytorch.pkl")
-
-
+    print(f"最佳模型已保存到 {best_model_path}")
 
 
 def parse_args():
-
+    """解析命令行参数"""
     parser = argparse.ArgumentParser(description='LSTM电力预测训练')
     parser.add_argument('--data-path', type=str, default='training_data.csv')
     parser.add_argument('--input-hours', type=int, default=20)
