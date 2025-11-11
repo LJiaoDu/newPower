@@ -79,18 +79,23 @@ class LSTMPowerPredictor(nn.Module):
         return x
 
 
-def calculate_acc_(y_actual, y_pred):
-    """计算ACC_指标（基于RMSE）"""
+def calculate_acc_(y_actual, y_pred, threshold=1.0):
+    """
+    计算ACC_指标（基于RMSE）
+    threshold: 只对真实值绝对值大于此阈值的样本计算ACC，避免小值导致相对误差爆炸
+    """
     y_actual_flat = y_actual.flatten()
     y_pred_flat = y_pred.flatten()
-    mask = y_actual_flat != 0
-    y_actual_nonzero = y_actual_flat[mask]
-    y_pred_nonzero = y_pred_flat[mask]
 
-    if len(y_actual_nonzero) == 0:
+    # 过滤掉真实值太小的样本（包括0和接近0的值）
+    mask = np.abs(y_actual_flat) > threshold
+    y_actual_filtered = y_actual_flat[mask]
+    y_pred_filtered = y_pred_flat[mask]
+
+    if len(y_actual_filtered) == 0:
         return 0.0
 
-    relative_errors = (y_actual_nonzero - y_pred_nonzero) / y_actual_nonzero
+    relative_errors = (y_actual_filtered - y_pred_filtered) / y_actual_filtered
     squared_errors = relative_errors ** 2
     rmse_relative = np.sqrt(np.mean(squared_errors))
     acc_ = 1 - rmse_relative
@@ -98,18 +103,23 @@ def calculate_acc_(y_actual, y_pred):
     return acc_ * 100
 
 
-def calculate_acc_mae(y_actual, y_pred):
-    """计算ACC_MAE指标（基于MAE）"""
+def calculate_acc_mae(y_actual, y_pred, threshold=1.0):
+    """
+    计算ACC_MAE指标（基于MAE）
+    threshold: 只对真实值绝对值大于此阈值的样本计算ACC，避免小值导致相对误差爆炸
+    """
     y_actual_flat = y_actual.flatten()
     y_pred_flat = y_pred.flatten()
-    mask = y_actual_flat != 0
-    y_actual_nonzero = y_actual_flat[mask]
-    y_pred_nonzero = y_pred_flat[mask]
 
-    if len(y_actual_nonzero) == 0:
+    # 过滤掉真实值太小的样本（包括0和接近0的值）
+    mask = np.abs(y_actual_flat) > threshold
+    y_actual_filtered = y_actual_flat[mask]
+    y_pred_filtered = y_pred_flat[mask]
+
+    if len(y_actual_filtered) == 0:
         return 0.0
 
-    relative_errors = np.abs((y_actual_nonzero - y_pred_nonzero) / y_actual_nonzero)
+    relative_errors = np.abs((y_actual_filtered - y_pred_filtered) / y_actual_filtered)
     mae_relative = np.mean(relative_errors)
     acc_mae = 1 - mae_relative
 
@@ -148,7 +158,7 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device):
     return avg_loss, avg_mae
 
 
-def validate(model, val_loader, criterion, device, y_scaler):
+def validate(model, val_loader, criterion, device, y_scaler, acc_threshold=1.0, debug=False):
     """验证模型"""
     model.eval()
 
@@ -187,8 +197,14 @@ def validate(model, val_loader, criterion, device, y_scaler):
         all_preds = y_scaler.inverse_transform(all_preds)
         all_targets = y_scaler.inverse_transform(all_targets)
 
-    acc_ = calculate_acc_(all_targets, all_preds)
-    acc_mae = calculate_acc_mae(all_targets, all_preds)
+    # 调试信息：显示数据范围
+    if debug:
+        print(f"\n[调试] 真实值范围: min={all_targets.min():.2f}, max={all_targets.max():.2f}, mean={all_targets.mean():.2f}")
+        print(f"[调试] 预测值范围: min={all_preds.min():.2f}, max={all_preds.max():.2f}, mean={all_preds.mean():.2f}")
+        print(f"[调试] ACC阈值: {acc_threshold}")
+
+    acc_ = calculate_acc_(all_targets, all_preds, threshold=acc_threshold)
+    acc_mae = calculate_acc_mae(all_targets, all_preds, threshold=acc_threshold)
 
     return avg_loss, avg_mae, acc_, acc_mae
 
@@ -355,8 +371,12 @@ def main(args):
         train_loss, train_mae = train_one_epoch(model, train_loader, optimizer, criterion, device)
         print(f"[训练完成] train_loss={train_loss:.4f}, train_mae={train_mae:.4f}")
 
-        # 验证阶段
-        val_loss, val_mae, acc_, acc_mae = validate(model, val_loader, criterion, device, y_scaler)
+        # 验证阶段（第一个epoch显示调试信息）
+        val_loss, val_mae, acc_, acc_mae = validate(
+            model, val_loader, criterion, device, y_scaler,
+            acc_threshold=args.acc_threshold,
+            debug=(epoch == 0)
+        )
         print(f"[验证完成] val_loss={val_loss:.4f}, val_mae={val_mae:.4f}, ACC_={acc_:.2f}%, ACC_MAE={acc_mae:.2f}%")
 
         # 学习率调度
@@ -420,6 +440,8 @@ def parse_args():
     parser.add_argument('--early-stop-patience', type=int, default=10)
     parser.add_argument('--lr-patience', type=int, default=5)
     parser.add_argument('--lr-factor', type=float, default=0.5)
+    parser.add_argument('--acc-threshold', type=float, default=1.0,
+                        help='ACC计算阈值，只对真实值大于此阈值的样本计算ACC (default: 1.0)')
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='auto')
     parser.add_argument('--seed', type=int, default=42)
