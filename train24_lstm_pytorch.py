@@ -1,9 +1,3 @@
-"""
-PyTorch Lightning版本：20小时历史数据预测未来4小时功率
-输入：过去20小时的功率数据（240个点，5分钟间隔）
-输出：未来4小时的功率预测（48个点，5分钟间隔）
-"""
-
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
@@ -22,36 +16,21 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, Learning
 from pytorch_lightning.callbacks import TQDMProgressBar
 
 # 配置参数
-LOOKBACK_HOURS = 20      # 输入：过去20小时
-FORECAST_HOURS = 4       # 输出：未来4小时
-INTERVAL_MINUTES = 5     # 数据间隔：5分钟
+LOOKBACK_HOURS = 20     
+FORECAST_HOURS = 4       
+INTERVAL_MINUTES = 5    
 
-LOOKBACK_POINTS = LOOKBACK_HOURS * 60 // INTERVAL_MINUTES  # 20h = 240个点
-FORECAST_POINTS = FORECAST_HOURS * 60 // INTERVAL_MINUTES  # 4h = 48个点
+LOOKBACK_POINTS = LOOKBACK_HOURS * 60 // INTERVAL_MINUTES  
+FORECAST_POINTS = FORECAST_HOURS * 60 // INTERVAL_MINUTES  
 
-# 设置随机种子
+
 np.random.seed(42)
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 
-# GPU配置
-print("="*60)
-print("GPU配置")
-print("="*60)
-if torch.cuda.is_available():
-    print(f"✓ 检测到GPU: {torch.cuda.get_device_name(0)}")
-    print(f"✓ CUDA版本: {torch.version.cuda}")
-    print(f"✓ GPU数量: {torch.cuda.device_count()}")
-else:
-    print("✗ 未检测到GPU，将使用CPU训练")
-    print("  (如果你有NVIDIA显卡，请确保安装了CUDA和PyTorch GPU版本)")
-print("="*60)
-print()
-
 
 class PowerDataset(Dataset):
-    """电力数据集"""
     def __init__(self, X, y):
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y)
@@ -64,16 +43,13 @@ class PowerDataset(Dataset):
 
 
 class LSTMPowerPredictor(pl.LightningModule):
-    """LSTM电力预测模型"""
 
     def __init__(self, y_scaler=None):
         super().__init__()
 
-        # 保存超参数
         self.save_hyperparameters(ignore=['y_scaler'])
         self.y_scaler = y_scaler
 
-        # 模型架构（和Keras版本完全一样）
         self.lstm1 = nn.LSTM(
             input_size=1,
             hidden_size=128,
@@ -84,30 +60,28 @@ class LSTMPowerPredictor(pl.LightningModule):
         self.dropout1 = nn.Dropout(0.2)
 
         self.lstm2 = nn.LSTM(
-            input_size=256,  # bidirectional所以是128*2
+            input_size=256,  
             hidden_size=64,
             num_layers=1,
             bidirectional=True,
             batch_first=True
         )
         self.dropout2 = nn.Dropout(0.2)
-
-        self.fc1 = nn.Linear(128, 128)  # 64*2
+        self.fc1 = nn.Linear(128, 128)  
         self.dropout3 = nn.Dropout(0.2)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, FORECAST_POINTS)
 
-        # 用于累积验证集预测结果
         self.validation_step_outputs = []
         self.validation_step_targets = []
 
     def forward(self, x):
-        # x: (batch, 240, 1)
+
         x, _ = self.lstm1(x)
         x = self.dropout1(x)
 
         x, _ = self.lstm2(x)
-        x = x[:, -1, :]  # 取最后一个时间步
+        x = x[:, -1, :]  
         x = self.dropout2(x)
 
         x = torch.relu(self.fc1(x))
@@ -118,67 +92,64 @@ class LSTMPowerPredictor(pl.LightningModule):
         return x
 
     def training_step(self, batch, batch_idx):
-        """训练步骤"""
+
         X, y = batch
         y_pred = self(X)
 
-        # 计算损失
+
         loss = nn.functional.mse_loss(y_pred, y)
         mae = torch.mean(torch.abs(y_pred - y))
 
-        # 记录指标（会自动显示在进度条）
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_mae', mae, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """验证步骤"""
+
         X, y = batch
         y_pred = self(X)
 
-        # 计算损失
+
         loss = nn.functional.mse_loss(y_pred, y)
         mae = torch.mean(torch.abs(y_pred - y))
 
-        # 记录指标
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_mae', mae, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
-        # 保存预测结果用于计算ACC指标
+
         self.validation_step_outputs.append(y_pred.detach().cpu())
         self.validation_step_targets.append(y.detach().cpu())
 
         return loss
 
     def on_validation_epoch_end(self):
-        """验证epoch结束后计算ACC指标"""
+
         if len(self.validation_step_outputs) == 0:
             return
 
-        # 合并所有batch的预测结果
+
         all_preds = torch.cat(self.validation_step_outputs, dim=0).numpy()
         all_targets = torch.cat(self.validation_step_targets, dim=0).numpy()
 
-        # 如果有scaler，逆归一化
+
         if self.y_scaler is not None:
             all_preds = self.y_scaler.inverse_transform(all_preds)
             all_targets = self.y_scaler.inverse_transform(all_targets)
 
-        # 计算ACC_指标
+
         acc_ = self.calculate_acc_(all_targets, all_preds)
         acc_mae = self.calculate_acc_mae(all_targets, all_preds)
 
-        # 记录
+
         self.log('val_acc_', acc_, prog_bar=True, logger=True)
         self.log('val_acc_mae', acc_mae, prog_bar=True, logger=True)
 
-        # 清空
         self.validation_step_outputs.clear()
         self.validation_step_targets.clear()
 
     def calculate_acc_(self, y_actual, y_pred):
-        """计算ACC_指标（基于RMSE）"""
+
         y_actual_flat = y_actual.flatten()
         y_pred_flat = y_pred.flatten()
 
@@ -197,7 +168,7 @@ class LSTMPowerPredictor(pl.LightningModule):
         return acc_ * 100
 
     def calculate_acc_mae(self, y_actual, y_pred):
-        """计算ACC_MAE指标（基于MAE）"""
+
         y_actual_flat = y_actual.flatten()
         y_pred_flat = y_pred.flatten()
 
@@ -215,10 +186,8 @@ class LSTMPowerPredictor(pl.LightningModule):
         return acc_mae * 100
 
     def configure_optimizers(self):
-        """配置优化器和学习率调度器"""
         optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
 
-        # 学习率衰减
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
@@ -240,11 +209,9 @@ class LSTMPowerPredictor(pl.LightningModule):
 
 
 def load_data():
-    """加载数据"""
-    print("="*60)
-    print("加载数据...")
-    print("="*60)
-    df = pd.read_csv('/home/user/newPower/training_data.csv')
+
+
+    df = pd.read_csv('training_data.csv')
     df['datetime'] = pd.to_datetime(df['datetime'])
     print(f"总数据点: {len(df)}")
     print(f"时间范围: {df['datetime'].min()} 到 {df['datetime'].max()}")
@@ -252,8 +219,7 @@ def load_data():
 
 
 def split_raw_data(df, train_ratio=0.8):
-    """划分原始数据集"""
-    print("\n划分原始数据集...")
+    print("\n划分原始数据集")
     split_idx = int(len(df) * train_ratio)
 
     df_train = df[:split_idx].copy()
@@ -266,10 +232,6 @@ def split_raw_data(df, train_ratio=0.8):
 
 
 def create_sequences(df, dataset_name="训练"):
-    """创建LSTM序列数据"""
-    print(f"\n创建{dataset_name}集序列...")
-    print(f"输入窗口: {LOOKBACK_HOURS}小时 ({LOOKBACK_POINTS}个点)")
-    print(f"输出窗口: {FORECAST_HOURS}小时 ({FORECAST_POINTS}个点)")
 
     power_values = df['generationPower'].values
 
@@ -288,21 +250,14 @@ def create_sequences(df, dataset_name="训练"):
     X = np.array(X)
     y = np.array(y)
 
-    # LSTM需要3D输入：(samples, timesteps, features)
     X = X.reshape((X.shape[0], X.shape[1], 1))
-
-    print(f"生成样本数: {len(X)}")
-    print(f"输入形状: {X.shape} (样本数, 时间步, 特征数)")
-    print(f"输出形状: {y.shape} (样本数, 预测点数)")
 
     return X, y
 
 
 def normalize_data(X_train, y_train, X_val, y_val):
-    """归一化数据"""
-    print("\n归一化数据...")
 
-    # 输入数据归一化
+
     X_scaler = StandardScaler()
     X_train_scaled = X_train.reshape(-1, 1)
     X_train_scaled = X_scaler.fit_transform(X_train_scaled)
@@ -317,34 +272,19 @@ def normalize_data(X_train, y_train, X_val, y_val):
     y_train_scaled = y_scaler.fit_transform(y_train)
     y_val_scaled = y_scaler.transform(y_val)
 
-    print("✓ 数据归一化完成")
+    print("数据归一化完成")
 
     return X_train_scaled, y_train_scaled, X_val_scaled, y_val_scaled, X_scaler, y_scaler
 
 
 def main():
-    """主函数"""
-    print("="*60)
-    print("PyTorch Lightning版本：LSTM神经网络训练")
-    print("="*60)
-    print()
 
-    # 1. 加载数据
     df = load_data()
-
-    # 2. 划分数据集
     df_train, df_val = split_raw_data(df)
-
-    # 3. 创建序列
     X_train, y_train = create_sequences(df_train, "训练")
     X_val, y_val = create_sequences(df_val, "验证")
-
-    # 4. 归一化
     X_train_scaled, y_train_scaled, X_val_scaled, y_val_scaled, X_scaler, y_scaler = \
         normalize_data(X_train, y_train, X_val, y_val)
-
-    # 5. 创建PyTorch Dataset和DataLoader
-    print("\n创建DataLoader...")
     batch_size = 128
 
     train_dataset = PowerDataset(X_train_scaled, y_train_scaled)
@@ -366,27 +306,12 @@ def main():
         pin_memory=True if torch.cuda.is_available() else False
     )
 
-    print(f"✓ batch_size: {batch_size}")
-    print(f"✓ 训练batches: {len(train_loader)}")
-    print(f"✓ 验证batches: {len(val_loader)}")
 
-    # 6. 创建模型
-    print("\n创建模型...")
     model = LSTMPowerPredictor(y_scaler=y_scaler)
 
-    # 打印模型结构
-    print("\n模型结构:")
-    print(model)
 
-    # 计算参数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n总参数量: {total_params:,}")
-    print(f"可训练参数: {trainable_params:,}")
-
-    # 7. 配置Callbacks
     callbacks = [
-        # 早停
+  
         EarlyStopping(
             monitor='val_loss',
             patience=10,
@@ -394,7 +319,7 @@ def main():
             verbose=True
         ),
 
-        # 保存最佳模型
+
         ModelCheckpoint(
             monitor='val_loss',
             dirpath='./checkpoints',
@@ -403,17 +328,13 @@ def main():
             mode='min'
         ),
 
-        # 学习率监控
+  
         LearningRateMonitor(logging_interval='epoch'),
 
-        # 自定义进度条（显示更多指标）
         TQDMProgressBar(refresh_rate=10)
     ]
 
-    # 8. 创建Trainer
-    print("\n" + "="*60)
-    print("训练配置")
-    print("="*60)
+
 
     trainer = pl.Trainer(
         max_epochs=100,
@@ -427,35 +348,14 @@ def main():
         precision=32,
     )
 
-    print(f"✓ 最大epoch数: 100")
-    print(f"✓ 设备: {'GPU' if torch.cuda.is_available() else 'CPU'}")
-    print(f"✓ 早停patience: 10")
-    print(f"✓ 学习率衰减patience: 5")
-    print("="*60)
 
-    # 9. 开始训练
-    print("\n开始训练...")
-    print("每个epoch包含:")
-    print("  1. 训练阶段 - 有进度条显示 train_loss 和 train_mae")
-    print("  2. 验证阶段 - 有进度条显示 val_loss 和 val_mae")
-    print()
 
     trainer.fit(model, train_loader, val_loader)
 
-    # 10. 训练完成
-    print("\n" + "="*60)
-    print("✓ 训练完成！")
-    print("="*60)
-    print(f"最佳模型保存在: {trainer.checkpoint_callback.best_model_path}")
-    print(f"最佳验证loss: {trainer.checkpoint_callback.best_model_score:.4f}")
 
-    # 11. 保存scaler
-    print("\n保存数据归一化器...")
     with open('scalers_pytorch.pkl', 'wb') as f:
         pickle.dump({'X_scaler': X_scaler, 'y_scaler': y_scaler}, f)
-    print("✓ 已保存到 scalers_pytorch.pkl")
-
-    print("\n全部完成！")
+    print("已保存到 scalers_pytorch.pkl")
 
 
 if __name__ == "__main__":
