@@ -32,6 +32,35 @@ FORECAST_POINTS = FORECAST_HOURS * 60 // INTERVAL_MINUTES
 np.random.seed(42)
 tf.random.set_seed(42)
 
+# GPU配置
+print("="*60)
+print("GPU配置")
+print("="*60)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # 设置GPU内存增长（避免占用所有显存）
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+
+        # 显示可用GPU
+        print(f"✓ 检测到 {len(gpus)} 个GPU:")
+        for i, gpu in enumerate(gpus):
+            print(f"  GPU {i}: {gpu.name}")
+
+        # 设置使用第一个GPU
+        tf.config.set_visible_devices(gpus[0], 'GPU')
+        logical_gpus = tf.config.list_logical_devices('GPU')
+        print(f"✓ 使用GPU: {logical_gpus[0].name}")
+        print("✓ GPU内存增长模式: 已启用")
+    except RuntimeError as e:
+        print(f"✗ GPU配置错误: {e}")
+else:
+    print("✗ 未检测到GPU，将使用CPU训练")
+    print("  (如果你有NVIDIA显卡，请确保安装了CUDA和cuDNN)")
+print("="*60)
+print()
+
 def load_data():
 
     df = pd.read_csv('training_data.csv')
