@@ -17,6 +17,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 torch.set_float32_matmul_precision('high')
 
@@ -364,6 +365,14 @@ def main(args):
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
+    # 训练历史记录
+    history = []
+
+    # TensorBoard日志
+    writer = SummaryWriter(log_dir='runs/lstm_power_prediction')
+    print(f"TensorBoard日志保存到: runs/lstm_power_prediction")
+    print(f"查看训练记录: tensorboard --logdir=runs\n")
+
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
@@ -382,6 +391,27 @@ def main(args):
         # 学习率调度
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]['lr']
+
+        # 记录训练历史
+        history.append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'train_mae': train_mae,
+            'val_loss': val_loss,
+            'val_mae': val_mae,
+            'acc_': acc_,
+            'acc_mae': acc_mae,
+            'lr': current_lr
+        })
+
+        # 记录到TensorBoard
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('Loss/val', val_loss, epoch)
+        writer.add_scalar('MAE/train', train_mae, epoch)
+        writer.add_scalar('MAE/val', val_mae, epoch)
+        writer.add_scalar('ACC/acc_', acc_, epoch)
+        writer.add_scalar('ACC/acc_mae', acc_mae, epoch)
+        writer.add_scalar('Learning_rate', current_lr, epoch)
 
         # 保存最佳模型
         if val_loss < best_val_loss:
@@ -408,7 +438,10 @@ def main(args):
             print(f"\n早停触发！已经{args.early_stop_patience}个epoch没有改进")
             break
 
-    # 9. 保存scaler
+    # 9. 关闭TensorBoard
+    writer.close()
+
+    # 10. 保存scaler
     print("\n" + "=" * 60)
     print("训练完成！")
     print("=" * 60)
