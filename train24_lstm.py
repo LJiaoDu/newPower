@@ -167,16 +167,19 @@ def train_model(model, X_train, y_train, X_val, y_val):
     print("训练配置")
     print("="*60)
 
-    # 计算batch_size以获得64个batch
-    num_batches = 64
-    batch_size = int(np.ceil(len(X_train) / num_batches))
+    # 设置batch_size
+    # 推荐: 128 (最佳平衡), 64 (更稳定), 256 (更快速)
+    batch_size = 128
+
+    train_batches = int(np.ceil(len(X_train) / batch_size))
+    val_batches = int(np.ceil(len(X_val) / batch_size))
 
     print(f"训练样本数: {len(X_train)}")
     print(f"验证样本数: {len(X_val)}")
-    print(f"目标batch数: {num_batches}")
     print(f"batch_size: {batch_size}")
-    print(f"实际训练batch数: {int(np.ceil(len(X_train) / batch_size))}")
-    print(f"实际验证batch数: {int(np.ceil(len(X_val) / batch_size))}")
+    print(f"训练batch数: {train_batches}")
+    print(f"验证batch数: {val_batches}")
+    print(f"每个epoch预计时间: ~3-5分钟 (GPU) / ~10-15分钟 (CPU)")
     print("="*60)
 
     callbacks = [
