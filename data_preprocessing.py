@@ -23,6 +23,10 @@ class PowerDataProcessor:
         print(f"从CSV文件加载数据: {file_path}")
         df = pd.read_csv(file_path)
 
+        # 统一列名（支持datetime或dateTime）
+        if 'datetime' in df.columns and 'dateTime' not in df.columns:
+            df.rename(columns={'datetime': 'dateTime'}, inplace=True)
+
         # 转换时间列
         if 'dateTime' in df.columns:
             # 如果是时间戳，转换为datetime
@@ -33,6 +37,8 @@ class PowerDataProcessor:
 
         df = df.sort_values('dateTime').reset_index(drop=True)
         print(f"总共加载 {len(df)} 条数据记录")
+        print(f"数据时间范围: {df['dateTime'].min()} 至 {df['dateTime'].max()}")
+        print(f"数据列: {list(df.columns)}")
         return df
 
     def load_json_files(self):
