@@ -162,15 +162,32 @@ def build_lstm_model():
     return model
 
 def train_model(model, X_train, y_train, X_val, y_val):
+    """训练LSTM模型"""
+    print("\n" + "="*60)
+    print("训练配置")
+    print("="*60)
 
+    # 计算batch_size以获得64个batch
+    num_batches = 64
+    batch_size = int(np.ceil(len(X_train) / num_batches))
+
+    print(f"训练样本数: {len(X_train)}")
+    print(f"验证样本数: {len(X_val)}")
+    print(f"目标batch数: {num_batches}")
+    print(f"batch_size: {batch_size}")
+    print(f"实际训练batch数: {int(np.ceil(len(X_train) / batch_size))}")
+    print(f"实际验证batch数: {int(np.ceil(len(X_val) / batch_size))}")
+    print("="*60)
 
     callbacks = [
+        # 早停
         EarlyStopping(
             monitor='val_loss',
             patience=10,
             restore_best_weights=True,
             verbose=1
         ),
+        # 学习率衰减
         ReduceLROnPlateau(
             monitor='val_loss',
             factor=0.5,
@@ -178,21 +195,21 @@ def train_model(model, X_train, y_train, X_val, y_val):
             min_lr=0.00001,
             verbose=1
         ),
+        # tqdm进度条
         TqdmCallback(verbose=2)
     ]
 
-
-    print(f"开始训练（预测{FORECAST_POINTS}个未来时间点）...")
+    print(f"\n开始训练（预测{FORECAST_POINTS}个未来时间点）...")
     history = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         epochs=100,
-        batch_size=32,
+        batch_size=batch_size,
         callbacks=callbacks,
-        verbose=0  
+        verbose=0
     )
 
-    print("模型训练完成")
+    print("\n✓ 模型训练完成")
 
     return model, history
 
