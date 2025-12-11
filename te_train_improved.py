@@ -265,10 +265,10 @@ def train_val(cfg):
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     writer = SummaryWriter(log_dir=f'runs/te_improved_{timestamp}')
 
-    # 早停参数
-    best_val_loss = float('inf')
+    # 早停参数（修复：ACC应该从0开始，不是inf）
+    best_val_acc = 0.0  # ACC越大越好，从0开始
     patience_counter = 0
-    patience = 5
+    patience = 10  # 增加patience，给更多训练机会
 
     # 创建检查点目录
     os.makedirs('./te_checkpoint_improved', exist_ok=True)
@@ -281,9 +281,9 @@ def train_val(cfg):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint.get('val_loss', float('inf'))
+        best_val_acc = checkpoint.get('best_val_acc', 0.0)
         patience_counter = checkpoint.get('patience_counter', 0)
-        print(f"从epoch {start_epoch} 恢复训练\n")
+        print(f"从epoch {start_epoch} 恢复训练，最佳ACC: {best_val_acc:.4f}\n")
 
     # 训练循环
     print("=" * 80)
@@ -481,6 +481,7 @@ def train_val(cfg):
             'val_loss': val_loss,
             'val_acc_mae': val_acc_mae,
             'val_acc_rmse': val_acc_rmse,
+            'best_val_acc': best_val_acc,
             'patience_counter': patience_counter,
             'power_log_max': train_data.power_log_max,
             'power_log_min': train_data.power_log_min,
@@ -490,9 +491,9 @@ def train_val(cfg):
         torch.save(checkpoint, f"./te_checkpoint_improved/checkpoint_epoch{epoch_i}.pth")
 
         # 保存最佳模型
-        if val_acc_mae > best_val_loss:  # 注意：ACC越大越好
-            improvement = (val_acc_mae - best_val_loss) / max(best_val_loss, 0.01) * 100
-            best_val_loss = val_acc_mae
+        if val_acc_mae > best_val_acc:  # 注意：ACC越大越好
+            improvement = (val_acc_mae - best_val_acc) / max(best_val_acc, 0.01) * 100
+            best_val_acc = val_acc_mae
             patience_counter = 0
             torch.save(checkpoint, f"./te_checkpoint_improved/best_epoch{epoch_i}.pth")
             print(f"✅ 保存最佳模型！Val ACC: {val_acc_mae:.4f} ({val_acc_mae*100:.2f}%)")
@@ -506,7 +507,7 @@ def train_val(cfg):
                 print(f"{'='*80}")
                 print(f"早停触发！连续 {patience} 个 epoch ACC没有改进")
                 print(f"{'='*80}")
-                print(f"最佳ACC: {best_val_loss:.4f} ({best_val_loss*100:.2f}%)")
+                print(f"最佳ACC: {best_val_acc:.4f} ({best_val_acc*100:.2f}%)")
                 print(f"{'='*80}\n")
                 break
 
@@ -516,7 +517,7 @@ def train_val(cfg):
     print("\n" + "="*80)
     print("训练完成！")
     print("="*80)
-    print(f"最佳ACC: {best_val_loss:.4f} ({best_val_loss*100:.2f}%)")
+    print(f"最佳ACC: {best_val_acc:.4f} ({best_val_acc*100:.2f}%)")
     print(f"检查点目录: ./te_checkpoint_improved/")
     print("="*80)
 
@@ -530,7 +531,7 @@ def get_args():
     parser.add_argument('--num-workers', type=int, default=4, help='数据加载线程数')
     parser.add_argument('--data-path', type=str, default='./te_training_data.csv', help='训练数据路径')
 
-    parser.add_argument('--lr-init', type=float, default=0.0003, help='初始学习率')
+    parser.add_argument('--lr-init', type=float, default=0.0002, help='初始学习率（降低以减少震荡）')
     parser.add_argument('--lr-final', type=float, default=0.00001, help='最终学习率')
 
     parser.add_argument('--in-seq-len', type=int, default=240, help='输入序列长度')
