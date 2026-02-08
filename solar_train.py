@@ -96,10 +96,10 @@ def train(args):
         in_seq_len=in_seq_len,
         out_seq_len=out_seq_len,
         hidden_size=args.hidden_size,
-        nhead=8,
-        num_encoder_layers=6,
-        num_cross_attn_layers=3,
-        dropout=0.15,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers,
+        num_cross_attn_layers=args.num_cross_attn_layers,
+        dropout=args.dropout,
     ).to(device)
 
     # 初始化权重
@@ -111,12 +111,11 @@ def train(args):
     print(f"模型参数量: {total_params:,}")
 
     # 优化器 + 调度器
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.03)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    warmup_epochs = 3
-    warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
-    cosine_sched = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6)
-    scheduler = SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[warmup_epochs])
+    warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=args.warmup_epochs)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[args.warmup_epochs])
 
     criterion = nn.MSELoss()
 
@@ -145,7 +144,7 @@ def train(args):
             pred = model(batch_x)
             loss = criterion(pred, batch_y)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
             train_loss += loss.item()
         train_loss /= len(train_loader)
@@ -237,6 +236,10 @@ def evaluate(args):
         in_seq_len=in_seq_len,
         out_seq_len=out_seq_len,
         hidden_size=args.hidden_size,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers,
+        num_cross_attn_layers=args.num_cross_attn_layers,
+        dropout=args.dropout,
     ).to(device)
 
     checkpoint = torch.load("solar_checkpoints/best_model.pth", map_location=device, weights_only=False)
@@ -297,13 +300,25 @@ def evaluate(args):
 
 def main():
     parser = argparse.ArgumentParser(description="太阳能电站功率预测")
+    # --- 运行模式 ---
     parser.add_argument("--mode", type=str, default="all",
                         choices=["all", "preprocess", "train", "evaluate"])
-    parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=0.0003)
-    parser.add_argument("--hidden-size", type=int, default=256)
-    parser.add_argument("--patience", type=int, default=10)
+
+    # --- 训练参数 ---
+    parser.add_argument("--epochs", type=int, default=80,         help="最大训练轮次")
+    parser.add_argument("--batch-size", type=int, default=64,     help="批大小")
+    parser.add_argument("--lr", type=float, default=0.0003,       help="学习率")
+    parser.add_argument("--weight-decay", type=float, default=0.03, help="L2正则化系数")
+    parser.add_argument("--patience", type=int, default=10,       help="Early Stopping 耐心值")
+    parser.add_argument("--warmup-epochs", type=int, default=3,   help="Warmup 轮次")
+    parser.add_argument("--grad-clip", type=float, default=1.0,   help="梯度裁剪阈值")
+
+    # --- 模型结构 ---
+    parser.add_argument("--hidden-size", type=int, default=256,   help="Transformer 隐藏层维度")
+    parser.add_argument("--nhead", type=int, default=8,           help="注意力头数")
+    parser.add_argument("--num-encoder-layers", type=int, default=6,  help="Encoder 层数")
+    parser.add_argument("--num-cross-attn-layers", type=int, default=3, help="Cross-Attention 层数")
+    parser.add_argument("--dropout", type=float, default=0.15,    help="Dropout 比率")
 
     args = parser.parse_args()
 
