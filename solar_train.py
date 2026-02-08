@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import os
 import argparse
@@ -121,6 +122,12 @@ def train(args):
 
     os.makedirs("solar_checkpoints", exist_ok=True)
 
+    # TensorBoard
+    log_dir = os.path.join("runs", time.strftime("%Y%m%d_%H%M%S"))
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"TensorBoard 日志: {log_dir}")
+    print(f"  启动命令: tensorboard --logdir=runs")
+
     best_val_loss = float("inf")
     patience_counter = 0
 
@@ -165,6 +172,14 @@ def train(args):
         mae = calc_mae(all_targets, all_preds, cap)
         lr = optimizer.param_groups[0]["lr"]
 
+        # TensorBoard 记录所有指标
+        writer.add_scalars("Loss", {"Train": train_loss, "Val": val_loss}, epoch + 1)
+        writer.add_scalar("Accuracy/ACC1", acc, epoch + 1)
+        writer.add_scalar("Accuracy/ACC2", acc2, epoch + 1)
+        writer.add_scalar("Error/RMSE_MW", rmse, epoch + 1)
+        writer.add_scalar("Error/MAE_MW", mae, epoch + 1)
+        writer.add_scalar("LearningRate", lr, epoch + 1)
+
         print(
             f"Epoch {epoch+1:3d}/{args.epochs} | "
             f"LR: {lr:.6f} | "
@@ -196,7 +211,9 @@ def train(args):
 
         scheduler.step()
 
+    writer.close()
     print(f"\n训练完成! 最佳验证损失: {best_val_loss:.6f}")
+    print(f"TensorBoard 查看: tensorboard --logdir=runs")
 
 
 # ============== 评估 ==============
@@ -222,7 +239,7 @@ def evaluate(args):
         hidden_size=args.hidden_size,
     ).to(device)
 
-    checkpoint = torch.load("solar_checkpoints/best_model.pth", map_location=device)
+    checkpoint = torch.load("solar_checkpoints/best_model.pth", map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
