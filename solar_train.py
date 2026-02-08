@@ -47,6 +47,15 @@ def calc_mae(y_true, y_pred, cap=1.0):
     return np.mean(np.abs(y_true * cap - y_pred * cap))
 
 
+def calc_acc2(y_true, y_pred, cap=1.0):
+    """ACC2 (国标): 1 - sqrt( (1/N) * Σ ((P_M - P_P) / max(P_M, 0.2*Cap))^2 )"""
+    p_m = y_true.flatten() * cap
+    p_p = y_pred.flatten() * cap
+    denom = np.maximum(p_m, 0.2 * cap)
+    acc2 = 1.0 - np.sqrt(np.mean(((p_m - p_p) / denom) ** 2))
+    return max(0.0, acc2)
+
+
 # ============== 训练 ==============
 
 def train(args):
@@ -151,6 +160,7 @@ def train(args):
         all_targets = np.concatenate(all_targets)
 
         acc = calc_acc_mae(all_targets, all_preds, cap)
+        acc2 = calc_acc2(all_targets, all_preds, cap)
         rmse = calc_rmse(all_targets, all_preds, cap)
         mae = calc_mae(all_targets, all_preds, cap)
         lr = optimizer.param_groups[0]["lr"]
@@ -160,7 +170,8 @@ def train(args):
             f"LR: {lr:.6f} | "
             f"Train: {train_loss:.6f} | "
             f"Val: {val_loss:.6f} | "
-            f"ACC: {acc:.4f} ({acc*100:.2f}%) | "
+            f"ACC1: {acc:.4f} | "
+            f"ACC2: {acc2:.4f} | "
             f"RMSE: {rmse:.2f} MW | "
             f"MAE: {mae:.2f} MW"
         )
@@ -232,15 +243,17 @@ def evaluate(args):
     all_targets = np.concatenate(all_targets)
 
     acc = calc_acc_mae(all_targets, all_preds, cap)
+    acc2 = calc_acc2(all_targets, all_preds, cap)
     rmse = calc_rmse(all_targets, all_preds, cap)
     mae = calc_mae(all_targets, all_preds, cap)
 
     print(f"\n{'='*60}")
     print(f"测试集评估结果")
     print(f"{'='*60}")
-    print(f"  ACC (MAE-based): {acc:.4f} ({acc*100:.2f}%)")
-    print(f"  RMSE:            {rmse:.2f} MW")
-    print(f"  MAE:             {mae:.2f} MW")
+    print(f"  ACC1 (MAE-based): {acc:.4f} ({acc*100:.2f}%)")
+    print(f"  ACC2 (国标):      {acc2:.4f} ({acc2*100:.2f}%)")
+    print(f"  RMSE:             {rmse:.2f} MW")
+    print(f"  MAE:              {mae:.2f} MW")
 
     # 按时间范围分析
     steps_per_hour = 4  # 15分钟粒度
@@ -256,8 +269,9 @@ def evaluate(args):
         yt = all_targets[:, start:end]
         yp = all_preds[:, start:end]
         h_acc = calc_acc_mae(yt, yp, cap)
+        h_acc2 = calc_acc2(yt, yp, cap)
         h_rmse = calc_rmse(yt, yp, cap)
-        print(f"  {name}: ACC={h_acc:.4f} ({h_acc*100:.2f}%), RMSE={h_rmse:.2f} MW")
+        print(f"  {name}: ACC1={h_acc:.4f}, ACC2={h_acc2:.4f}, RMSE={h_rmse:.2f} MW")
 
     print(f"{'='*60}")
 
