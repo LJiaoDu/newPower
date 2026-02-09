@@ -9,6 +9,12 @@
   python solar_train.py --mode evaluate     # 仅评估
 """
 
+import sys
+import os
+
+# 确保优先从脚本所在目录导入本地模块
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,7 +23,6 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import math
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-import os
 import argparse
 import pickle
 import time
