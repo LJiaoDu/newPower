@@ -333,6 +333,11 @@ def main():
     parser.add_argument("--mode", type=str, default="all",
                         choices=["all", "preprocess", "train", "evaluate"])
 
+    # --- 数据路径 ---
+    parser.add_argument("--csv-path", type=str,
+                        default="/media/zlg/Data1/Longjiao/TF208/solar_station_1.csv",
+                        help="原始 CSV 数据路径")
+
     # --- 训练参数 ---
     parser.add_argument("--epochs", type=int, default=80,         help="最大训练轮次")
     parser.add_argument("--batch-size", type=int, default=64,     help="批大小")
@@ -356,7 +361,7 @@ def main():
 
     if args.mode in ["all", "preprocess"]:
         print("\n[1/3] 数据预处理")
-        preprocess_main()
+        preprocess_main(args.csv_path)
 
     if args.mode in ["all", "train"]:
         print("\n[2/3] 模型训练")
