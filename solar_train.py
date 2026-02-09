@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+import math
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import os
@@ -113,9 +114,24 @@ def train(args):
     # 优化器 + 调度器
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=args.warmup_epochs)
-    cosine_sched = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=1e-6)
-    scheduler = SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[args.warmup_epochs])
+    steps_per_epoch = len(train_loader)
+    warmup_steps = args.warmup_epochs * steps_per_epoch
+    # T_0: 首个重启周期的 epoch 数; T_mult: 后续周期倍增因子
+    cosine_scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=args.restart_period,
+        T_mult=args.restart_mult,
+        eta_min=args.eta_min,
+    )
+
+    def lr_lambda(current_step):
+        """Warmup + Cosine Warm Restarts (step 级别调度)"""
+        if current_step < warmup_steps:
+            # 线性 warmup: 从 0.01x 线性增长到 1.0x
+            return 0.01 + 0.99 * current_step / warmup_steps
+        return 1.0  # warmup 结束后由 cosine_scheduler 控制
+
+    warmup_lambda = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     criterion = nn.MSELoss()
 
@@ -131,8 +147,12 @@ def train(args):
     patience_counter = 0
 
     print(f"\n{'='*60}")
-    print(f"开始训练 | Epochs: {args.epochs} | Batch: {args.batch_size} | LR: {args.lr}")
+    print(f"开始训练 | Epochs: {args.epochs} | Batch: {args.batch_size} | Peak LR: {args.lr}")
+    print(f"Warmup: {args.warmup_epochs} epochs ({warmup_steps} steps) | "
+          f"Restart: T0={args.restart_period}, Tmult={args.restart_mult} | eta_min={args.eta_min}")
     print(f"{'='*60}\n")
+
+    global_step = 0
 
     for epoch in range(args.epochs):
         # --- 训练 ---
@@ -147,6 +167,15 @@ def train(args):
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
             train_loss += loss.item()
+
+            # Step 级别学习率更新
+            global_step += 1
+            if global_step <= warmup_steps:
+                warmup_lambda.step()
+            else:
+                # warmup 结束后使用 cosine warm restarts (epoch 分数形式)
+                cosine_scheduler.step(epoch + (global_step % steps_per_epoch) / steps_per_epoch)
+
         train_loss /= len(train_loader)
 
         # --- 验证 ---
@@ -208,7 +237,7 @@ def train(args):
                 print(f"\nEarly stopping: {args.patience} epochs 无改善")
                 break
 
-        scheduler.step()
+        # 学习率已在每个 step 内更新，无需 epoch 级别调度
 
     writer.close()
     print(f"\n训练完成! 最佳验证损失: {best_val_loss:.6f}")
@@ -307,11 +336,14 @@ def main():
     # --- 训练参数 ---
     parser.add_argument("--epochs", type=int, default=80,         help="最大训练轮次")
     parser.add_argument("--batch-size", type=int, default=64,     help="批大小")
-    parser.add_argument("--lr", type=float, default=0.0003,       help="学习率")
+    parser.add_argument("--lr", type=float, default=0.0005,       help="峰值学习率")
     parser.add_argument("--weight-decay", type=float, default=0.03, help="L2正则化系数")
-    parser.add_argument("--patience", type=int, default=10,       help="Early Stopping 耐心值")
-    parser.add_argument("--warmup-epochs", type=int, default=3,   help="Warmup 轮次")
+    parser.add_argument("--patience", type=int, default=15,       help="Early Stopping 耐心值")
+    parser.add_argument("--warmup-epochs", type=int, default=5,   help="Warmup 轮次 (step 级别线性增长)")
     parser.add_argument("--grad-clip", type=float, default=1.0,   help="梯度裁剪阈值")
+    parser.add_argument("--eta-min", type=float, default=1e-6,    help="学习率下界")
+    parser.add_argument("--restart-period", type=int, default=15, help="Cosine 首个重启周期 (epochs)")
+    parser.add_argument("--restart-mult", type=int, default=2,    help="重启周期倍增因子")
 
     # --- 模型结构 ---
     parser.add_argument("--hidden-size", type=int, default=256,   help="Transformer 隐藏层维度")
