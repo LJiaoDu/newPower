@@ -176,7 +176,7 @@ def split_and_save(X, y, norm_params, feature_names,
 
 
 def main():
-    csv_path = "solar_station_1.csv"
+    csv_path = "/media/zlg/Data1/Longjiao/TF208/solar_station_1.csv"
 
     print("=" * 60)
     print("太阳能电站数据预处理")
