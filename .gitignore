@@ -1,0 +1,5 @@
+*.npy
+*.pkl
+__pycache__/
+solar_checkpoints/
+runs/
