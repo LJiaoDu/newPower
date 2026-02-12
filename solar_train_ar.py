@@ -150,12 +150,14 @@ def eval_metrics(y_true, y_pred, cap):
 # ============== 自回归多步推理评估 ==============
 
 def ar_evaluate_multistep(model, X_enc, X_dec, y_true, cap, device,
-                          batch_size=256, out_steps=16):
+                          batch_size=256, out_steps=16, desc="评估"):
     """自回归滑动窗口推理 → 评估16步"""
     model.eval()
     all_preds = []
+    n_batches = (len(X_enc) + batch_size - 1) // batch_size
 
-    for start in range(0, len(X_enc), batch_size):
+    for start in tqdm(range(0, len(X_enc), batch_size), total=n_batches,
+                      desc=desc, leave=False, unit="batch"):
         end = min(start + batch_size, len(X_enc))
         x_enc = torch.FloatTensor(X_enc[start:end]).to(device)
         x_dec = torch.FloatTensor(X_dec[start:end]).to(device)
@@ -285,7 +287,8 @@ def train(args):
         if (epoch + 1) % 5 == 0 or epoch == 0:
             _, metrics = ar_evaluate_multistep(
                 model, Xe_val, Xd_val, y_val, cap, device,
-                batch_size=args.batch_size, out_steps=args.out_steps)
+                batch_size=args.batch_size, out_steps=args.out_steps,
+                desc="验证集AR推理")
             writer.add_scalar("AR/ACC1", metrics["acc1"], epoch + 1)
             writer.add_scalar("AR/ACC2", metrics["acc2"], epoch + 1)
             writer.add_scalar("AR/RMSE", metrics["rmse"], epoch + 1)
@@ -360,7 +363,8 @@ def evaluate(args):
 
     all_preds, metrics = ar_evaluate_multistep(
         model, Xe_test, Xd_test, y_test, cap, device,
-        batch_size=args.batch_size, out_steps=args.out_steps)
+        batch_size=args.batch_size, out_steps=args.out_steps,
+        desc="测试集AR推理")
 
     print(f"\n{'='*60}")
     print(f"测试集评估 (自回归滑动窗口推理)")
