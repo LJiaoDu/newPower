@@ -21,6 +21,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 import numpy as np
 import os
 import argparse
@@ -242,11 +243,14 @@ def train(args):
     print(f"模型: d={args.d_model}, heads={args.nhead}, layers={args.num_layers}")
     print(f"{'='*70}\n")
 
-    for epoch in range(args.epochs):
+    epoch_bar = tqdm(range(args.epochs), desc="训练进度", unit="epoch")
+    for epoch in epoch_bar:
         # --- 训练: Teacher Forcing 16步, loss 算在 [B, 16] 上 ---
         model.train()
         train_loss = 0.0
-        for batch_xf, batch_y in train_loader:
+        batch_bar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}", leave=False,
+                         unit="batch")
+        for batch_xf, batch_y in batch_bar:
             batch_xf = batch_xf.to(device)  # [B, 112, 13]
             batch_y = batch_y.to(device)     # [B, 16]
 
@@ -257,6 +261,7 @@ def train(args):
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
             train_loss += loss.item()
+            batch_bar.set_postfix(loss=f"{loss.item():.6f}")
         train_loss /= len(train_loader)
 
         # --- 验证: Teacher Forcing loss ---
@@ -269,6 +274,8 @@ def train(args):
                 pred = model(batch_xf, out_steps=args.out_steps)
                 val_loss += criterion(pred, batch_y).item()
         val_loss /= len(val_tf_loader)
+
+        epoch_bar.set_postfix(train=f"{train_loss:.6f}", val=f"{val_loss:.6f}")
 
         lr = optimizer.param_groups[0]["lr"]
         writer.add_scalars("Loss", {"Train": train_loss, "Val": val_loss}, epoch + 1)
