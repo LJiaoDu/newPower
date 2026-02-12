@@ -283,8 +283,8 @@ def train(args):
         writer.add_scalars("Loss", {"Train": train_loss, "Val": val_loss}, epoch + 1)
         writer.add_scalar("LearningRate", lr, epoch + 1)
 
-        # --- 每 5 epoch 做自回归推理评估 ---
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        # --- 每个 epoch 做自回归推理评估 ---
+        if True:
             _, metrics = ar_evaluate_multistep(
                 model, Xe_val, Xd_val, y_val, cap, device,
                 batch_size=args.batch_size, out_steps=args.out_steps,
@@ -298,11 +298,6 @@ def train(args):
                 f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
                 f"AR-ACC1: {metrics['acc1']:.4f} | AR-ACC2: {metrics['acc2']:.4f} | "
                 f"AR-RMSE: {metrics['rmse']:.2f} MW"
-            )
-        else:
-            print(
-                f"Epoch {epoch+1:3d}/{args.epochs} | LR: {lr:.6f} | "
-                f"Train: {train_loss:.6f} | Val: {val_loss:.6f}"
             )
 
         # 保存最佳模型
