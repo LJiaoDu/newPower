@@ -2,23 +2,21 @@
 """
 太阳能电站功率预测 - 自回归 Transformer (Autoregressive)
 
-核心思路:
-  训练: 输入 96 步 [B, 96, 13] → 预测下一步 [B, 1]
-  推理: 滑动窗口逐步预测 16 步
-    step 1: input[0:96]  → pred[96]
-    step 2: input[1:97]  → pred[97]   (位置96 = 预测值 + 已知未来气象)
-    step 3: input[2:98]  → pred[98]
+训练 & 推理都输出 16 步:
+  训练 (Teacher Forcing 滑动窗口):
+    step 1:  x_full[0:96]   → pred[96]     (窗口内全是真实值)
+    step 2:  x_full[1:97]   → pred[97]
+    step 3:  x_full[2:98]   → pred[98]
     ...
-    step16: input[15:111] → pred[111]
+    step16:  x_full[15:111]  → pred[111]
+    loss = HuberLoss(pred[0:16], y[0:16])
 
-优势:
-  - 每步预测都基于最新的上下文 (含之前的预测结果)
-  - 训练目标简单 (单步预测), 模型更容易学习
-  - Encoder-only 结构, 比 Encoder-Decoder 更轻量
-
-劣势:
-  - 推理时有误差累积 (前面的预测误差会传播到后面)
-  - 推理速度较慢 (需要串行执行 16 次前向传播)
+  推理 (自回归滑动窗口):
+    step 1:  input[0:96]   → pred_96
+    step 2:  input[1:97]   → pred_97     (位置96 = [已知气象, pred_96])
+    step 3:  input[2:98]   → pred_98     (位置97 = [已知气象, pred_97])
+    ...
+    step16:  input[15:111] → pred_111
 """
 
 import torch
@@ -50,12 +48,11 @@ class PositionalEncoding(nn.Module):
 
 class SolarTransformerAR(nn.Module):
     """
-    自回归 Transformer: 输入 96 步, 预测下一步
+    自回归 Transformer
 
-    训练输入: [B, 96, 13]  (历史: 功率 + 气象 + 时间)
-    训练输出: [B]           (下一步功率)
-
-    推理时调用 predict_sequence() 逐步滚动预测 16 步
+    单步前向: [B, 96, 13] → [B]
+    训练: forward_sequence()   Teacher Forcing 滑动16步 → [B, 16]
+    推理: predict_sequence()   自回归滑动16步            → [B, 16]
     """
 
     def __init__(
@@ -97,7 +94,7 @@ class SolarTransformerAR(nn.Module):
             norm=nn.LayerNorm(d_model),
         )
 
-        # 输出头: 取最后一个位置的隐状态 → 预测 1 个值
+        # 输出头: 取最后位置 → 预测 1 个值
         self.output_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
@@ -105,39 +102,56 @@ class SolarTransformerAR(nn.Module):
             nn.Linear(d_model // 2, 1),
         )
 
-    def forward(self, x):
+    def _forward_one_step(self, x):
         """
-        单步预测 (训练用)
-        Args:
-            x: [B, seq_len, feat_size]
-        Returns:
-            [B] 下一步功率预测
+        单步前向: [B, seq_len, feat_size] → [B]
         """
-        h = self.projection(x)  # [B, 96, d_model]
+        h = self.projection(x)
         h = self.pos_enc(h)
-        h = self.encoder(h)  # [B, 96, d_model]
+        h = self.encoder(h)
+        last = h[:, -1, :]
+        return self.output_head(last).squeeze(-1)
 
-        last = h[:, -1, :]  # [B, d_model]  取最后位置
-        out = self.output_head(last)  # [B, 1]
-        return out.squeeze(-1)  # [B]
+    def forward(self, x_full, out_steps=16):
+        """
+        训练用: Teacher Forcing 滑动窗口, 输出 16 步预测
+
+        Args:
+            x_full:    [B, seq_len + out_steps, 13]  完整序列 (112步, 含真实功率)
+            out_steps: 预测步数 (默认16)
+
+        Returns:
+            [B, out_steps]  16个预测值
+
+        过程:
+            step 0:  x_full[:, 0:96,  :] → pred[0]
+            step 1:  x_full[:, 1:97,  :] → pred[1]   (位置96是真实值, teacher forcing)
+            ...
+            step 15: x_full[:, 15:111, :] → pred[15]
+        """
+        predictions = []
+        for t in range(out_steps):
+            window = x_full[:, t : t + self.seq_len, :]  # [B, 96, 13]
+            pred = self._forward_one_step(window)  # [B]
+            predictions.append(pred)
+        return torch.stack(predictions, dim=1)  # [B, out_steps]
 
     @torch.no_grad()
     def predict_sequence(self, x_hist, future_covariates, out_steps=16):
         """
-        自回归滑动窗口推理: 逐步预测 out_steps 步
+        推理用: 自回归滑动窗口, 用自己的预测值填充
 
         Args:
-            x_hist:              [B, seq_len, 13]  初始历史数据
-            future_covariates:   [B, out_steps, 12] 未来气象 + 时间特征
-            out_steps:           预测步数 (默认 16 = 4小时)
+            x_hist:            [B, seq_len, 13]   初始历史数据
+            future_covariates: [B, out_steps, 12]  未来气象 + 时间
+            out_steps:         预测步数
 
         Returns:
-            [B, out_steps] 预测功率序列
+            [B, out_steps]
 
-        推理过程:
-            窗口 [0:96]  → pred_96
-            窗口 [1:97]  → pred_97  (位置96 = [future_cov[0], pred_96])
-            窗口 [2:98]  → pred_98  (位置97 = [future_cov[1], pred_97])
+        过程:
+            step 0: input[0:96]   → pred_0
+            step 1: input[1:97]   → pred_1  (位置96 = [future_cov[0], pred_0])
             ...
         """
         self.eval()
@@ -145,28 +159,18 @@ class SolarTransformerAR(nn.Module):
         current = x_hist.clone()  # [B, seq_len, 13]
 
         for t in range(out_steps):
-            # 预测下一步
-            pred = self.forward(current)  # [B]
+            pred = self._forward_one_step(current)  # [B]
             predictions.append(pred)
 
             if t < out_steps - 1:
-                # 构造新的一步: [未来气象+时间(12维), 预测功率(1维)] = 13维
+                # 构造新步: [气象+时间(12维), 预测功率(1维)] = 13维
                 new_step = torch.cat(
-                    [
-                        future_covariates[:, t, :],  # [B, 12]
-                        pred.unsqueeze(-1),  # [B, 1]
-                    ],
+                    [future_covariates[:, t, :], pred.unsqueeze(-1)],
                     dim=-1,
-                )  # [B, 13]
+                ).unsqueeze(1)  # [B, 1, 13]
 
-                # 滑动窗口: 丢弃最早的一步, 追加新的一步
-                current = torch.cat(
-                    [
-                        current[:, 1:, :],  # [B, 95, 13]
-                        new_step.unsqueeze(1),  # [B, 1, 13]
-                    ],
-                    dim=1,
-                )  # [B, 96, 13]
+                # 滑动: 丢弃最早一步, 追加新步
+                current = torch.cat([current[:, 1:, :], new_step], dim=1)
 
         return torch.stack(predictions, dim=1)  # [B, out_steps]
 
@@ -175,24 +179,18 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"设备: {device}")
 
-    model = SolarTransformerAR(
-        feat_size=13,
-        d_model=256,
-        nhead=8,
-        num_layers=6,
-        seq_len=96,
-    ).to(device)
-
+    model = SolarTransformerAR(feat_size=13, d_model=256, nhead=8,
+                                num_layers=6, seq_len=96).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"参数量: {total_params:,}")
 
-    # 测试单步预测 (训练模式)
-    x = torch.randn(4, 96, 13).to(device)
-    with torch.no_grad():
-        out = model(x)
-    print(f"单步预测:  输入 {x.shape} → 输出 {out.shape}")
+    # 测试训练模式: Teacher Forcing 16步
+    x_full = torch.randn(4, 112, 13).to(device)
+    out = model(x_full, out_steps=16)
+    print(f"训练 (TF):  输入 {x_full.shape} → 输出 {out.shape}")
 
-    # 测试自回归推理 (16步)
-    future_cov = torch.randn(4, 16, 12).to(device)
-    seq = model.predict_sequence(x, future_cov, out_steps=16)
-    print(f"自回归推理: 输入 {x.shape} + 未来协变量 {future_cov.shape} → 输出 {seq.shape}")
+    # 测试推理模式: 自回归 16步
+    x_hist = torch.randn(4, 96, 13).to(device)
+    future = torch.randn(4, 16, 12).to(device)
+    seq = model.predict_sequence(x_hist, future, out_steps=16)
+    print(f"推理 (AR):  输入 {x_hist.shape} + {future.shape} → 输出 {seq.shape}")
