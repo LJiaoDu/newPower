@@ -35,9 +35,12 @@ from solar_preprocess import load_and_clean, extract_features
 # ============== 数据准备 ==============
 
 def create_ar_sequences(enc_features, dec_features, targets,
-                        in_steps=96, out_steps=16):
+                        in_steps=96, out_steps=16, daytime_only=False):
     """
     创建自回归训练 + 评估序列
+
+    Args:
+      daytime_only: 若为True, 只保留目标中有发电(非全零)的样本
 
     返回:
       X_full: [N, 112, 13]  完整序列 (训练用, 含真实功率, teacher forcing 滑窗)
@@ -47,12 +50,20 @@ def create_ar_sequences(enc_features, dec_features, targets,
     """
     total_len = in_steps + out_steps
     X_full_list, X_enc_list, X_dec_list, y_list = [], [], [], []
+    n_skipped = 0
 
     for i in range(len(enc_features) - total_len + 1):
+        target = targets[i + in_steps : i + total_len]
+
+        # 过滤: 目标全零(纯夜间)的样本跳过
+        if daytime_only and (target < 0.001).all():
+            n_skipped += 1
+            continue
+
         X_full_list.append(enc_features[i : i + total_len])       # [112, 13]
         X_enc_list.append(enc_features[i : i + in_steps])         # [96, 13]
         X_dec_list.append(dec_features[i + in_steps : i + total_len])  # [16, 12]
-        y_list.append(targets[i + in_steps : i + total_len])      # [16]
+        y_list.append(target)                                      # [16]
 
     X_full = np.array(X_full_list, dtype=np.float32)
     X_enc = np.array(X_enc_list, dtype=np.float32)
@@ -61,6 +72,8 @@ def create_ar_sequences(enc_features, dec_features, targets,
 
     print(f"  X_full={X_full.shape}, X_enc={X_enc.shape}, "
           f"X_dec={X_dec.shape}, y={y.shape}")
+    if n_skipped > 0:
+        print(f"  过滤掉 {n_skipped} 个纯夜间样本")
     return X_full, X_enc, X_dec, y
 
 
@@ -79,15 +92,15 @@ def preprocess(csv_path, in_steps=96, out_steps=16,
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
 
-    print("\n训练集:")
+    print("\n训练集 (仅白天):")
     Xf_train, Xe_train, Xd_train, y_train = create_ar_sequences(
         enc_features[:train_end], dec_features[:train_end],
-        targets[:train_end], in_steps, out_steps)
+        targets[:train_end], in_steps, out_steps, daytime_only=True)
 
-    print("验证集:")
+    print("验证集 (仅白天):")
     Xf_val, Xe_val, Xd_val, y_val = create_ar_sequences(
         enc_features[train_end:val_end], dec_features[train_end:val_end],
-        targets[train_end:val_end], in_steps, out_steps)
+        targets[train_end:val_end], in_steps, out_steps, daytime_only=True)
 
     print("测试集:")
     Xf_test, Xe_test, Xd_test, y_test = create_ar_sequences(
