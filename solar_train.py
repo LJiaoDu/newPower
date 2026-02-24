@@ -26,6 +26,7 @@ import os
 import argparse
 import pickle
 import time
+from tqdm import tqdm
 
 from solar_model import SolarTransformer
 from solar_preprocess import main as preprocess_main
@@ -155,11 +156,14 @@ def train(args):
           f"enc_layers={args.num_encoder_layers}, dec_layers={args.num_decoder_layers}")
     print(f"{'='*70}\n")
 
-    for epoch in range(args.epochs):
+    epoch_bar = tqdm(range(args.epochs), desc="Training", unit="epoch")
+    for epoch in epoch_bar:
         # --- 训练 ---
         model.train()
         train_loss = 0.0
-        for batch_enc, batch_dec, batch_y in train_loader:
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]",
+                         leave=False, unit="batch")
+        for batch_enc, batch_dec, batch_y in train_bar:
             batch_enc = batch_enc.to(device)
             batch_dec = batch_dec.to(device)
             batch_y = batch_y.to(device)
@@ -171,14 +175,17 @@ def train(args):
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
             train_loss += loss.item()
+            train_bar.set_postfix(loss=f"{loss.item():.6f}")
         train_loss /= len(train_loader)
 
         # --- 验证 ---
         model.eval()
         val_loss = 0.0
         all_preds, all_targets = [], []
+        val_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]",
+                       leave=False, unit="batch")
         with torch.no_grad():
-            for batch_enc, batch_dec, batch_y in val_loader:
+            for batch_enc, batch_dec, batch_y in val_bar:
                 batch_enc = batch_enc.to(device)
                 batch_dec = batch_dec.to(device)
                 batch_y = batch_y.to(device)
@@ -206,7 +213,9 @@ def train(args):
         writer.add_scalar("Error/MAE_MW", mae, epoch + 1)
         writer.add_scalar("LearningRate", lr, epoch + 1)
 
-        print(
+        epoch_bar.set_postfix(train=f"{train_loss:.5f}", val=f"{val_loss:.5f}",
+                              ACC1=f"{acc1:.4f}", ACC2=f"{acc2:.4f}")
+        tqdm.write(
             f"Epoch {epoch+1:3d}/{args.epochs} | "
             f"LR: {lr:.6f} | "
             f"Train: {train_loss:.6f} | "
@@ -230,11 +239,11 @@ def train(args):
                 "norm_params": norm_params,
                 "args": vars(args),
             }, "solar_checkpoints/best_model.pth")
-            print(f"  -> 保存最佳模型 (Val Loss: {val_loss:.6f})")
+            tqdm.write(f"  -> 保存最佳模型 (Val Loss: {val_loss:.6f})")
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
-                print(f"\nEarly stopping: {args.patience} epochs 无改善")
+                tqdm.write(f"\nEarly stopping: {args.patience} epochs 无改善")
                 break
 
         scheduler.step()
@@ -292,8 +301,9 @@ def evaluate(args):
     )
 
     all_preds, all_targets = [], []
+    test_bar = tqdm(test_loader, desc="Testing", unit="batch")
     with torch.no_grad():
-        for batch_enc, batch_dec, batch_y in test_loader:
+        for batch_enc, batch_dec, batch_y in test_bar:
             batch_enc = batch_enc.to(device)
             batch_dec = batch_dec.to(device)
             pred = model(batch_enc, batch_dec)
