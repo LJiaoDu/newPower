@@ -101,6 +101,24 @@ def calc_acc2(y_true, y_pred, cap=1.0):
     return max(0.0, 1.0 - np.sqrt(np.mean(((p_m - p_p) / denom) ** 2)))
 
 
+# ============== 夜间过滤 ==============
+
+def filter_nighttime(X_enc, X_dec, y, threshold=0.01):
+    """
+    过滤纯夜间样本 (16步目标全部 < threshold 的样本)
+    保留日夜交界和纯白天样本
+    """
+    n_before = len(y)
+    mask = np.any(y > threshold, axis=1)  # 只要有任意一步 > 0 就保留
+    X_enc_f = X_enc[mask]
+    X_dec_f = X_dec[mask]
+    y_f = y[mask]
+    n_after = len(y_f)
+    n_removed = n_before - n_after
+    print(f"  夜间过滤: {n_before} -> {n_after} (移除 {n_removed} 纯夜间样本, {n_removed/n_before*100:.1f}%)")
+    return X_enc_f, X_dec_f, y_f
+
+
 # ============== 训练 ==============
 
 def train(args):
@@ -119,8 +137,16 @@ def train(args):
         norm_params = pickle.load(f)
     cap = norm_params["power"]["cap"]
 
-    print(f"训练集: enc={X_enc_train.shape}, dec={X_dec_train.shape}, y={y_train.shape}")
-    print(f"验证集: enc={X_enc_val.shape}, dec={X_dec_val.shape}, y={y_val.shape}")
+    print(f"训练集 (原始): enc={X_enc_train.shape}, dec={X_dec_train.shape}, y={y_train.shape}")
+    print(f"验证集 (原始): enc={X_enc_val.shape}, dec={X_dec_val.shape}, y={y_val.shape}")
+
+    # 过滤纯夜间样本
+    print("\n过滤纯夜间样本 (16步目标全零):")
+    X_enc_train, X_dec_train, y_train = filter_nighttime(X_enc_train, X_dec_train, y_train)
+    X_enc_val, X_dec_val, y_val = filter_nighttime(X_enc_val, X_dec_val, y_val)
+
+    print(f"\n训练集 (过滤后): enc={X_enc_train.shape}, y={y_train.shape}")
+    print(f"验证集 (过滤后): enc={X_enc_val.shape}, y={y_val.shape}")
     print(f"标称容量: {cap} MW")
 
     enc_seq_len = X_enc_train.shape[1]
