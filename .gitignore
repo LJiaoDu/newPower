@@ -1,0 +1,21 @@
+# 预处理生成的 numpy 数组
+*.npy
+norm_params.pkl
+feature_names.pkl
+
+# 模型 checkpoint
+lstm_checkpoints/
+solar_checkpoints/
+
+# TensorBoard 日志
+runs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+venv/
+.env/
