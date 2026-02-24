@@ -187,7 +187,7 @@ def train(args):
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard 日志: {log_dir}")
 
-    best_val_loss = float("inf")
+    best_acc2 = -1.0
     patience_counter = 0
 
     print(f"\n{'='*70}")
@@ -269,9 +269,9 @@ def train(args):
             f"MAE: {mae:.2f} MW"
         )
 
-        # 保存最佳模型
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # 保存最佳模型 (按 ACC2 最高)
+        if acc2 > best_acc2:
+            best_acc2 = acc2
             patience_counter = 0
             torch.save({
                 "epoch": epoch,
@@ -282,17 +282,17 @@ def train(args):
                 "norm_params": norm_params,
                 "args": vars(args),
             }, "solar_checkpoints/best_model_rope_tsi.pth")
-            tqdm.write(f"  -> 保存最佳模型 (Val Loss: {val_loss:.6f})")
+            tqdm.write(f"  -> 保存最佳模型 (ACC2: {acc2:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
-                tqdm.write(f"\nEarly stopping: {args.patience} epochs 无改善")
+                tqdm.write(f"\nEarly stopping: {args.patience} epochs ACC2 无改善")
                 break
 
         scheduler.step()
 
     writer.close()
-    print(f"\n训练完成! 最佳验证损失: {best_val_loss:.6f}")
+    print(f"\n训练完成! 最佳 ACC2: {best_acc2:.4f}")
 
 
 # ============== 评估 ==============
