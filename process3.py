@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-太阳能电站多站点数据预处理脚本 v1 (基于 process2.py)
+太阳能电站多站点数据预处理脚本 v2 (基于 process2.py)
 
-支持同时处理多个站点的 CSV 文件，为每个样本附加 site_id 标识。
+支持同时处理多个站点的数据文件，格式兼容：
+  - CSV  文件: 列名需满足 process2.py 要求 (time/tsi/dni/ghi/temp/atm/rh/power/cap)
+  - XLSX 文件: 列名自动映射，标称容量从文件名 "...XXX MW..." 自动提取
+
 各站点气象特征独立归一化（使用各自的 min/max 和 cap），保证特征量纲一致。
 训练集在各站点内部按时间顺序划分后再混合，不跨站点泄露未来信息。
 
@@ -12,16 +15,23 @@
   y_{train,val,test}.npy        [N, 16]       预测目标 (归一化)
   site_id_{train,val,test}.npy  [N]           int64, 站点索引 0~(num_sites-1)
   norm_params_multi.pkl          dict {site_id: norm_params}
-  site_configs.pkl               dict {site_id: {name, cap, csv_path, n_samples}}
+  site_configs.pkl               dict {site_id: {name, cap, path, n_samples}}
 
 使用方式:
-  python process3.py --csv-paths site1.csv site2.csv site3.csv site4.csv site5.csv
-  python process3.py --csv-paths site*.csv --output-dir ./data_multi
+  # xlsx 文件 (推荐，列名自动映射)
+  python process3.py --paths "site1.xlsx" "site2.xlsx" "site3.xlsx"
+
+  # csv 文件
+  python process3.py --paths site1.csv site2.csv site3.csv
+
+  # 混合也可以
+  python process3.py --paths site1.xlsx site2.csv --output-dir ./data_multi
 """
 
 import argparse
 import os
 import pickle
+import re
 
 import numpy as np
 
@@ -34,13 +44,122 @@ from process2 import (
 
 
 # ============================================================
+# XLSX → 标准 DataFrame 转换
+# ============================================================
+
+# xlsx 列名 → process2.py 期望的列名
+_XLSX_COL_MAP = {
+    "Time(year-month-day h:m:s)":          "time",
+    "Total solar irradiance (W/m2)":        "tsi",
+    "Direct normal irradiance (W/m2)":      "dni",
+    "Global horizontal irradiance (W/m2)":  "ghi",
+    "Air temperature  (°C) ":              "temp",   # 原始有多余空格
+    "Air temperature (°C)":                "temp",   # 无多余空格的变体
+    "Air temperature  (°C)":               "temp",   # 一个多余空格的变体
+    "Atmosphere (hpa)":                    "atm",
+    "Relative humidity (%)":               "rh",
+    "Power (MW)":                          "power",
+}
+
+
+def _extract_cap_from_filename(path: str) -> float:
+    """从文件名中提取标称容量，例如 '...50MW...' → 50.0"""
+    name = os.path.basename(path)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*MW", name, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    raise ValueError(
+        f"无法从文件名提取标称容量(MW)，请确认文件名包含 'XXXMW' 格式: {name}"
+    )
+
+
+def load_xlsx_as_standard_df(xlsx_path: str):
+    """
+    读取 xlsx 文件，将列名映射到 process2.py 期望的格式，
+    并添加 cap 列（从文件名提取）。
+
+    Returns:
+        pandas.DataFrame  包含 time/tsi/dni/ghi/temp/atm/rh/power/cap 列
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        raise ImportError("请先安装 pandas 和 openpyxl: pip install pandas openpyxl")
+
+    df = pd.read_excel(xlsx_path, sheet_name=0)
+    print(f"  读取 xlsx: {len(df)} 行, 原始列: {list(df.columns)}")
+
+    # 对列名做 strip 处理再匹配，应对多余空格
+    col_rename = {}
+    for col in df.columns:
+        stripped = col.strip()
+        # 先尝试精确匹配
+        if stripped in _XLSX_COL_MAP:
+            col_rename[col] = _XLSX_COL_MAP[stripped]
+        else:
+            # 再尝试原始列名
+            if col in _XLSX_COL_MAP:
+                col_rename[col] = _XLSX_COL_MAP[col]
+
+    df = df.rename(columns=col_rename)
+
+    # 检查必要列是否全部存在
+    required = {"time", "tsi", "dni", "ghi", "temp", "atm", "rh", "power"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"xlsx 列名映射后仍缺少: {missing}\n"
+            f"当前列: {list(df.columns)}\n"
+            f"请检查 _XLSX_COL_MAP 是否覆盖了所有列名"
+        )
+
+    # 从文件名提取容量并写入 cap 列
+    cap = _extract_cap_from_filename(xlsx_path)
+    df["cap"] = cap
+    print(f"  标称容量: {cap} MW (从文件名提取)")
+
+    return df
+
+
+# ============================================================
 # 单站点处理
 # ============================================================
 
-def process_one_site(csv_path: str, site_id: int,
+def load_site_df(path: str):
+    """
+    根据文件扩展名自动选择加载方式：
+      .xlsx / .xls → load_xlsx_as_standard_df (列名自动映射 + cap 从文件名提取)
+      .csv         → load_and_clean (process2 原始流程，需文件内含 cap 列)
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xls"):
+        df_raw = load_xlsx_as_standard_df(path)
+        # load_and_clean 期望 CSV 路径，此处直接传已加载的 df 的清洗逻辑
+        # 复现 load_and_clean 核心逻辑（不重复读文件）
+        import pandas as pd
+        weather_cols = ["tsi", "dni", "ghi", "temp", "atm", "rh"]
+        df_raw["time"] = pd.to_datetime(df_raw["time"])
+        for col in weather_cols:
+            n_bad = (df_raw[col] == -99).sum()
+            if n_bad > 0:
+                df_raw.loc[df_raw[col] == -99, col] = float("nan")
+                print(f"  {col}: 替换 {n_bad} 个 -99 值")
+        n_rh_bad = (df_raw["rh"] > 100).sum()
+        if n_rh_bad > 0:
+            df_raw.loc[df_raw["rh"] > 100, "rh"] = float("nan")
+            print(f"  rh: 替换 {n_rh_bad} 个 >100% 传感器故障值")
+        df_raw[weather_cols] = df_raw[weather_cols].interpolate(method="linear")
+        df_raw[weather_cols] = df_raw[weather_cols].bfill().ffill()
+        print(f"  清洗后缺失值: {df_raw.isnull().sum().sum()}")
+        return df_raw
+    else:
+        return load_and_clean(path)
+
+
+def process_one_site(path: str, site_id: int,
                      in_steps: int = 96, out_steps: int = 16):
     """
-    处理单个站点的完整预处理流程 (复用 process2 的所有函数)
+    处理单个站点的完整预处理流程，兼容 xlsx 和 csv。
 
     Returns:
         X_enc      : [N, in_steps, 16]
@@ -51,10 +170,10 @@ def process_one_site(csv_path: str, site_id: int,
         cap        : float 标称容量 (MW)
     """
     print(f"\n{'─' * 60}")
-    print(f"站点 {site_id}: {os.path.basename(csv_path)}")
+    print(f"站点 {site_id}: {os.path.basename(path)}")
     print(f"{'─' * 60}")
 
-    df = load_and_clean(csv_path)
+    df = load_site_df(path)
     df = compute_tsi_features(df)
 
     enc_features, dec_features, targets, norm_params, _, _ = extract_features(df)
@@ -72,12 +191,12 @@ def process_one_site(csv_path: str, site_id: int,
 # 多站点合并主流程
 # ============================================================
 
-def main(csv_paths, output_dir=".", train_ratio=0.7, val_ratio=0.15, seed=42):
+def main(paths, output_dir=".", train_ratio=0.7, val_ratio=0.15, seed=42):
     """
     多站点数据预处理主流程
 
     Args:
-        csv_paths  : list[str]  各站点 CSV 文件路径列表（顺序即为站点编号）
+        paths      : list[str]  各站点文件路径列表（xlsx 或 csv，顺序即为站点编号）
         output_dir : str        输出目录
         train_ratio: float      训练集占比（按各站点时间顺序划分）
         val_ratio  : float      验证集占比
@@ -86,7 +205,7 @@ def main(csv_paths, output_dir=".", train_ratio=0.7, val_ratio=0.15, seed=42):
     os.makedirs(output_dir, exist_ok=True)
 
     print("=" * 70)
-    print(f"多站点数据预处理 | 站点数: {len(csv_paths)}")
+    print(f"多站点数据预处理 | 站点数: {len(paths)}")
     print("=" * 70)
 
     # 各站点分别预处理并按时间划分
@@ -94,15 +213,15 @@ def main(csv_paths, output_dir=".", train_ratio=0.7, val_ratio=0.15, seed=42):
     norm_params_multi = {}
     site_configs = {}
 
-    for site_id, csv_path in enumerate(csv_paths):
+    for site_id, path in enumerate(paths):
         X_enc, X_dec, y, site_ids, norm_params, cap = process_one_site(
-            csv_path, site_id
+            path, site_id
         )
         norm_params_multi[site_id] = norm_params
         site_configs[site_id] = {
-            "name":      os.path.splitext(os.path.basename(csv_path))[0],
+            "name":      os.path.splitext(os.path.basename(path))[0],
             "cap":       cap,
-            "csv_path":  csv_path,
+            "path":      path,
             "n_samples": len(X_enc),
         }
 
@@ -151,7 +270,7 @@ def main(csv_paths, output_dir=".", train_ratio=0.7, val_ratio=0.15, seed=42):
         # 统计各站点样本量
         site_counts = {
             sid: int((sid_all == sid).sum())
-            for sid in range(len(csv_paths))
+            for sid in range(len(paths))
         }
         count_str = ", ".join(f"站点{k}:{v}" for k, v in site_counts.items())
         print(f"  {split_name:5s}: {len(X_enc_all):7d} 样本  ({count_str})")
@@ -178,10 +297,10 @@ def main(csv_paths, output_dir=".", train_ratio=0.7, val_ratio=0.15, seed=42):
 # ============================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="多站点太阳能数据预处理")
+    parser = argparse.ArgumentParser(description="多站点太阳能数据预处理 (支持 xlsx/csv)")
     parser.add_argument(
-        "--csv-paths", nargs="+", required=True,
-        help="各站点 CSV 文件路径（空格分隔），路径顺序即为站点编号"
+        "--paths", nargs="+", required=True,
+        help="各站点文件路径（xlsx 或 csv，空格分隔），顺序即为站点编号"
     )
     parser.add_argument(
         "--output-dir", type=str, default=".",
@@ -192,4 +311,4 @@ if __name__ == "__main__":
     parser.add_argument("--seed",        type=int,   default=42)
     args = parser.parse_args()
 
-    main(args.csv_paths, args.output_dir, args.train_ratio, args.val_ratio, args.seed)
+    main(args.paths, args.output_dir, args.train_ratio, args.val_ratio, args.seed)

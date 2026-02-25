@@ -545,7 +545,7 @@ def main():
         if not args.csv_paths:
             raise ValueError("--mode all/preprocess 时必须提供 --csv-paths")
         print("\n[1/3] 多站点数据预处理")
-        preprocess_main(args.csv_paths)
+        preprocess_main(args.csv_paths)   # process3.main(paths=...)
 
     if args.mode in ["all", "train"]:
         print("\n[2/3] 多站点模型训练")
