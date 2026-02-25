@@ -47,6 +47,7 @@ class ACC2Loss(nn.Module):
         self.cap_norm = cap_norm
 
     def forward(self, pred, target):
+        pred = torch.clamp(pred, min=0.0)          # 功率物理约束: 不能为负
         denom = torch.clamp(target, min=0.2 * self.cap_norm)
         return torch.mean(((pred - target) / denom) ** 2)
 
