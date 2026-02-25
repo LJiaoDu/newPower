@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+太阳能电站功率预测 - Encoder-Decoder 训练脚本 (混合 Loss 版)
+
+改动点 (为了解决：val loss 低但 acc 下降难以定位的问题)：
+1) 验证/训练阶段把 MixedLoss 拆分记录：
+   - MSE
+   - ACC2Loss
+   - MixedLoss
+   并打印 + TensorBoard 记录
+2) 默认以 ACC2 作为“保存最佳模型”与 EarlyStopping 的指标（更贴近你的目标）
+   同时额外保存 MixedLoss 最佳模型，便于对照。
+
+使用方式:
+  python solar_train_ed.py                          # 完整流程: 预处理 + 训练 + 评估
+  python solar_train_ed.py --mode train             # 仅训练
+  python solar_train_ed.py --mode evaluate          # 仅评估
+  python solar_train_ed.py --lambda-mse 1.0 --lambda-acc2 0.5  # 调整 loss 权重
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+import os
+import argparse
+import pickle
+import time
+from tqdm import tqdm
+
+from solar_model import SolarTransformer
+from solar_preprocess import main as preprocess_main
+
+
+# ============== 混合 Loss ==============
+
+class ACC2Loss(nn.Module):
+    """
+    基于国标 ACC2 的损失函数
+    L = mean( ((pred - target) / max(target, 0.2 * cap_norm))^2 )
+
+    cap_norm: 归一化后的容量值 (cap/cap = 1.0)
+    """
+    def __init__(self, cap_norm=1.0):
+        super().__init__()
+        self.cap_norm = cap_norm
+
+    def forward(self, pred, target):
+        denom = torch.clamp(target, min=0.2 * self.cap_norm)
+        relative_error = (pred - target) / denom
+        return torch.mean(relative_error ** 2)
+
+
+class MixedLoss(nn.Module):
+    """
+    混合 Loss = λ_mse * MSE + λ_acc2 * ACC2_Loss
+
+    MSE:       绝对误差, 对高功率段敏感
+    ACC2 Loss: 相对误差, 与评估指标对齐, 对低功率段也有约束
+    """
+    def __init__(self, lambda_mse=1.0, lambda_acc2=0.5, cap_norm=1.0):
+        super().__init__()
+        self.lambda_mse = lambda_mse
+        self.lambda_acc2 = lambda_acc2
+        self.mse_loss = nn.MSELoss()
+        self.acc2_loss = ACC2Loss(cap_norm=cap_norm)
+
+    def forward(self, pred, target):
+        l_mse = self.mse_loss(pred, target)
+        l_acc2 = self.acc2_loss(pred, target)
+        return self.lambda_mse * l_mse + self.lambda_acc2 * l_acc2
+
+
+# ============== 评估指标 ==============
+
+def calc_acc_mae(y_true, y_pred, cap=1.0):
+    """ACC1 (MAE-based): 1 - MAE / mean(y_true)"""
+    mask = y_true > 0.01
+    if mask.sum() == 0:
+        return float("nan")
+    y_t = y_true[mask] * cap
+    y_p = y_pred[mask] * cap
+    mae = np.mean(np.abs(y_t - y_p))
+    avg = np.mean(y_t)
+    return max(0.0, 1.0 - mae / (avg + 1e-6))
+
+
+def calc_rmse(y_true, y_pred, cap=1.0):
+    return np.sqrt(np.mean((y_true * cap - y_pred * cap) ** 2))
+
+
+def calc_mae(y_true, y_pred, cap=1.0):
+    return np.mean(np.abs(y_true * cap - y_pred * cap))
+
+
+def calc_acc2(y_true, y_pred, cap=1.0):
+    """ACC2 (国标): 1 - sqrt( (1/N) * sum( ((P_M - P_P) / max(P_M, 0.2*Cap))^2 ) )"""
+    p_m = y_true.flatten() * cap
+    p_p = y_pred.flatten() * cap
+    denom = np.maximum(p_m, 0.2 * cap)
+    return max(0.0, 1.0 - np.sqrt(np.mean(((p_m - p_p) / denom) ** 2)))
+
+
+# ============== 训练 ==============
+
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"设备: {device}")
+
+    # 加载数据
+    X_enc_train = np.load("X_enc_train.npy")
+    X_dec_train = np.load("X_dec_train.npy")
+    y_train = np.load("y_train.npy")
+    X_enc_val = np.load("X_enc_val.npy")
+    X_dec_val = np.load("X_dec_val.npy")
+    y_val = np.load("y_val.npy")
+
+    with open("norm_params.pkl", "rb") as f:
+        norm_params = pickle.load(f)
+    cap = norm_params["power"]["cap"]
+
+    print(f"训练集: enc={X_enc_train.shape}, dec={X_dec_train.shape}, y={y_train.shape}")
+    print(f"验证集: enc={X_enc_val.shape}, dec={X_dec_val.shape}, y={y_val.shape}")
+    print(f"标称容量: {cap} MW")
+
+    enc_seq_len = X_enc_train.shape[1]
+    enc_feat_size = X_enc_train.shape[2]
+    dec_seq_len = X_dec_train.shape[1]
+    dec_feat_size = X_dec_train.shape[2]
+
+    # DataLoader
+    train_loader = DataLoader(
+        TensorDataset(
+            torch.FloatTensor(X_enc_train),
+            torch.FloatTensor(X_dec_train),
+            torch.FloatTensor(y_train),
+        ),
+        batch_size=args.batch_size, shuffle=True,
+    )
+    val_loader = DataLoader(
+        TensorDataset(
+            torch.FloatTensor(X_enc_val),
+            torch.FloatTensor(X_dec_val),
+            torch.FloatTensor(y_val),
+        ),
+        batch_size=args.batch_size, shuffle=False,
+    )
+
+    # 模型
+    model = SolarTransformer(
+        enc_feat_size=enc_feat_size,
+        dec_feat_size=dec_feat_size,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        dim_feedforward=args.d_model * 4,
+        dropout=args.dropout,
+        enc_seq_len=enc_seq_len,
+        dec_seq_len=dec_seq_len,
+    ).to(device)
+
+    # Xavier 初始化
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p, gain=0.5)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型参数量: {total_params:,}")
+
+    # 优化器
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    warmup_epochs = min(args.warmup_epochs, max(1, args.epochs - 1))
+    warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    cosine_T = max(1, args.epochs - warmup_epochs)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=cosine_T, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[warmup_epochs])
+
+    # 混合 Loss: MSE + ACC2
+    criterion = MixedLoss(
+        lambda_mse=args.lambda_mse,
+        lambda_acc2=args.lambda_acc2,
+        cap_norm=1.0,
+    )
+    print(f"Loss: MixedLoss(λ_mse={args.lambda_mse}, λ_acc2={args.lambda_acc2})")
+
+    os.makedirs("solar_checkpoints", exist_ok=True)
+
+    # TensorBoard
+    log_dir = os.path.join("runs", f"ed_{time.strftime('%Y%m%d_%H%M%S')}")
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"TensorBoard 日志: {log_dir}")
+
+    # —— 早停/保存：默认以 ACC2 为准 —— #
+    best_val_loss = float("inf")   # MixedLoss best
+    best_acc2 = -1.0               # ACC2 best
+    patience_counter = 0
+
+    print(f"\n{'='*70}")
+    print(f"开始训练 | Epochs: {args.epochs} | Batch: {args.batch_size} | LR: {args.lr}")
+    print(f"Loss: λ_mse={args.lambda_mse} * MSE + λ_acc2={args.lambda_acc2} * ACC2Loss")
+    print(f"保存&早停指标: ACC2 (同时额外保存 MixedLoss 最佳)")
+    print(f"模型: d_model={args.d_model}, heads={args.nhead}, enc_layers={args.num_encoder_layers}, dec_layers={args.num_decoder_layers}")
+    print(f"{'='*70}\n")
+
+    epoch_bar = tqdm(range(args.epochs), desc="Training", unit="epoch")
+    for epoch in epoch_bar:
+        # --- 训练 ---
+        model.train()
+        train_mixed_sum = 0.0
+        train_mse_sum = 0.0
+        train_acc2loss_sum = 0.0
+
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]",
+                         leave=False, unit="batch")
+        for batch_enc, batch_dec, batch_y in train_bar:
+            batch_enc = batch_enc.to(device)
+            batch_dec = batch_dec.to(device)
+            batch_y = batch_y.to(device)
+
+            optimizer.zero_grad()
+            pred = model(batch_enc, batch_dec)
+
+            # 拆分
+            l_mse = criterion.mse_loss(pred, batch_y)
+            l_acc2 = criterion.acc2_loss(pred, batch_y)
+            loss = args.lambda_mse * l_mse + args.lambda_acc2 * l_acc2
+
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+            optimizer.step()
+
+            train_mixed_sum += loss.item()
+            train_mse_sum += l_mse.item()
+            train_acc2loss_sum += l_acc2.item()
+            train_bar.set_postfix(mixed=f"{loss.item():.6f}", mse=f"{l_mse.item():.6f}", acc2l=f"{l_acc2.item():.6f}")
+
+        train_mixed = train_mixed_sum / len(train_loader)
+        train_mse = train_mse_sum / len(train_loader)
+        train_acc2loss = train_acc2loss_sum / len(train_loader)
+
+        # --- 验证 ---
+        model.eval()
+        val_mixed_sum = 0.0
+        val_mse_sum = 0.0
+        val_acc2loss_sum = 0.0
+        all_preds, all_targets = [], []
+
+        val_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]",
+                       leave=False, unit="batch")
+        with torch.no_grad():
+            for batch_enc, batch_dec, batch_y in val_bar:
+                batch_enc = batch_enc.to(device)
+                batch_dec = batch_dec.to(device)
+                batch_y = batch_y.to(device)
+
+                pred = model(batch_enc, batch_dec)
+
+                l_mse = criterion.mse_loss(pred, batch_y)
+                l_acc2 = criterion.acc2_loss(pred, batch_y)
+                loss = args.lambda_mse * l_mse + args.lambda_acc2 * l_acc2
+
+                val_mixed_sum += loss.item()
+                val_mse_sum += l_mse.item()
+                val_acc2loss_sum += l_acc2.item()
+
+                all_preds.append(pred.cpu().numpy())
+                all_targets.append(batch_y.cpu().numpy())
+
+        val_mixed = val_mixed_sum / len(val_loader)
+        val_mse = val_mse_sum / len(val_loader)
+        val_acc2loss = val_acc2loss_sum / len(val_loader)
+
+        all_preds = np.concatenate(all_preds)
+        all_targets = np.concatenate(all_targets)
+
+        acc1 = calc_acc_mae(all_targets, all_preds, cap)
+        acc2 = calc_acc2(all_targets, all_preds, cap)
+        rmse = calc_rmse(all_targets, all_preds, cap)
+        mae = calc_mae(all_targets, all_preds, cap)
+        lr = optimizer.param_groups[0]["lr"]
+
+        # TensorBoard（拆分记录）
+        writer.add_scalars("Loss/Mixed", {"Train": train_mixed, "Val": val_mixed}, epoch + 1)
+        writer.add_scalars("Loss/MSE", {"Train": train_mse, "Val": val_mse}, epoch + 1)
+        writer.add_scalars("Loss/ACC2Loss", {"Train": train_acc2loss, "Val": val_acc2loss}, epoch + 1)
+
+        writer.add_scalar("Accuracy/ACC1", acc1, epoch + 1)
+        writer.add_scalar("Accuracy/ACC2", acc2, epoch + 1)
+        writer.add_scalar("Error/RMSE_MW", rmse, epoch + 1)
+        writer.add_scalar("Error/MAE_MW", mae, epoch + 1)
+        writer.add_scalar("LearningRate", lr, epoch + 1)
+
+        epoch_bar.set_postfix(
+            tr=f"{train_mixed:.5f}", va=f"{val_mixed:.5f}",
+            ACC2=f"{acc2:.4f}"
+        )
+
+        tqdm.write(
+            f"Epoch {epoch+1:3d}/{args.epochs} | LR: {lr:.6f} | "
+            f"Train(Mix/MSE/ACC2L): {train_mixed:.6f}/{train_mse:.6f}/{train_acc2loss:.6f} | "
+            f"Val(Mix/MSE/ACC2L): {val_mixed:.6f}/{val_mse:.6f}/{val_acc2loss:.6f} | "
+            f"ACC1: {acc1:.4f} | ACC2: {acc2:.4f} | "
+            f"RMSE: {rmse:.2f} MW | MAE: {mae:.2f} MW"
+        )
+
+        # 1) 保存 MixedLoss 最佳（对照用）
+        if val_mixed < best_val_loss:
+            best_val_loss = val_mixed
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "val_mixed": val_mixed,
+                "val_mse": val_mse,
+                "val_acc2loss": val_acc2loss,
+                "acc1": acc1,
+                "acc2": acc2,
+                "norm_params": norm_params,
+                "args": vars(args),
+            }, "solar_checkpoints/best_model_ed_mixedloss.pth")
+            tqdm.write(f"  -> 保存 MixedLoss 最佳模型 (Val MixedLoss: {val_mixed:.6f})")
+
+        # 2) 保存 ACC2 最佳（默认你真正要的）
+        improved = False
+        if acc2 > best_acc2:
+            best_acc2 = acc2
+            improved = True
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "val_mixed": val_mixed,
+                "val_mse": val_mse,
+                "val_acc2loss": val_acc2loss,
+                "acc1": acc1,
+                "acc2": acc2,
+                "norm_params": norm_params,
+                "args": vars(args),
+            }, "solar_checkpoints/best_model_ed_acc2.pth")
+            tqdm.write(f"  -> 保存 ACC2 最佳模型 (ACC2: {acc2:.6f})")
+
+        # Early stopping（按 ACC2）
+        if improved:
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                tqdm.write(f"\nEarly stopping: {args.patience} epochs ACC2 无提升")
+                break
+
+        scheduler.step()
+
+    writer.close()
+    print(f"\n训练完成!")
+    print(f"  MixedLoss 最佳: {best_val_loss:.6f}  -> solar_checkpoints/best_model_ed_mixedloss.pth")
+    print(f"  ACC2     最佳: {best_acc2:.6f}  -> solar_checkpoints/best_model_ed_acc2.pth")
+
+
+# ============== 评估 ==============
+
+def evaluate(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    X_enc_test = np.load("X_enc_test.npy")
+    X_dec_test = np.load("X_dec_test.npy")
+    y_test = np.load("y_test.npy")
+
+    with open("norm_params.pkl", "rb") as f:
+        norm_params = pickle.load(f)
+    cap = norm_params["power"]["cap"]
+
+    enc_feat_size = X_enc_test.shape[2]
+    dec_feat_size = X_dec_test.shape[2]
+    enc_seq_len = X_enc_test.shape[1]
+    dec_seq_len = X_dec_test.shape[1]
+
+    model = SolarTransformer(
+        enc_feat_size=enc_feat_size,
+        dec_feat_size=dec_feat_size,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        dim_feedforward=args.d_model * 4,
+        dropout=args.dropout,
+        enc_seq_len=enc_seq_len,
+        dec_seq_len=dec_seq_len,
+    ).to(device)
+
+    # 默认评估 ACC2 最佳模型（更符合你目标）
+    ckpt_path = "solar_checkpoints/best_model_ed_acc2.pth"
+    if not os.path.exists(ckpt_path):
+        # 兼容：如果还没训练过新文件名
+        fallback = "solar_checkpoints/best_model_ed.pth"
+        if os.path.exists(fallback):
+            ckpt_path = fallback
+        else:
+            raise FileNotFoundError("找不到 checkpoint: best_model_ed_acc2.pth 或 best_model_ed.pth")
+
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    print(f"加载模型: {ckpt_path}")
+    print(f"  epoch={checkpoint['epoch']+1}")
+    if "val_mixed" in checkpoint:
+        print(f"  val_mixed={checkpoint['val_mixed']:.6f}, val_mse={checkpoint['val_mse']:.6f}, val_acc2loss={checkpoint['val_acc2loss']:.6f}")
+    if "acc2" in checkpoint:
+        print(f"  acc2={checkpoint['acc2']:.6f}")
+
+    test_loader = DataLoader(
+        TensorDataset(
+            torch.FloatTensor(X_enc_test),
+            torch.FloatTensor(X_dec_test),
+            torch.FloatTensor(y_test),
+        ),
+        batch_size=args.batch_size, shuffle=False,
+    )
+
+    all_preds, all_targets = [], []
+    test_bar = tqdm(test_loader, desc="Testing", unit="batch")
+    with torch.no_grad():
+        for batch_enc, batch_dec, batch_y in test_bar:
+            batch_enc = batch_enc.to(device)
+            batch_dec = batch_dec.to(device)
+            pred = model(batch_enc, batch_dec)
+            all_preds.append(pred.cpu().numpy())
+            all_targets.append(batch_y.numpy())
+
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
+
+    acc1 = calc_acc_mae(all_targets, all_preds, cap)
+    acc2 = calc_acc2(all_targets, all_preds, cap)
+    rmse = calc_rmse(all_targets, all_preds, cap)
+    mae = calc_mae(all_targets, all_preds, cap)
+
+    print(f"\n{'='*60}")
+    print(f"测试集评估结果")
+    print(f"{'='*60}")
+    print(f"  ACC1 (MAE-based): {acc1:.4f} ({acc1*100:.2f}%)")
+    print(f"  ACC2 (国标):      {acc2:.4f} ({acc2*100:.2f}%)")
+    print(f"  RMSE:             {rmse:.2f} MW")
+    print(f"  MAE:              {mae:.2f} MW")
+
+    # 按预测时间范围分析
+    steps_per_hour = 4
+    horizons = [
+        (0, steps_per_hour, "0-1h"),
+        (steps_per_hour, 2 * steps_per_hour, "1-2h"),
+        (2 * steps_per_hour, 3 * steps_per_hour, "2-3h"),
+        (3 * steps_per_hour, 4 * steps_per_hour, "3-4h"),
+    ]
+
+    print(f"\n按预测时间范围:")
+    for start, end, name in horizons:
+        yt = all_targets[:, start:end]
+        yp = all_preds[:, start:end]
+        h_acc1 = calc_acc_mae(yt, yp, cap)
+        h_acc2 = calc_acc2(yt, yp, cap)
+        h_rmse = calc_rmse(yt, yp, cap)
+        h_mae = calc_mae(yt, yp, cap)
+        print(f"  {name}: ACC1={h_acc1:.4f}, ACC2={h_acc2:.4f}, RMSE={h_rmse:.2f} MW, MAE={h_mae:.2f} MW")
+
+    print(f"{'='*60}")
+
+
+# ============== 主入口 ==============
+
+def main():
+    parser = argparse.ArgumentParser(description="太阳能电站功率预测 (ED Transformer + 混合 Loss)")
+
+    # --- 运行模式 ---
+    parser.add_argument("--mode", type=str, default="all",
+                        choices=["all", "preprocess", "train", "evaluate"])
+    parser.add_argument("--csv-path", type=str,
+                        default="solar_station_1.csv",
+                        help="solar_station_1.csv 文件路径")
+
+    # --- 训练参数 ---
+    parser.add_argument("--epochs", type=int, default=100, help="最大训练轮次")
+    parser.add_argument("--batch-size", type=int, default=64, help="批大小")
+    parser.add_argument("--lr", type=float, default=3e-4, help="学习率")
+    parser.add_argument("--weight-decay", type=float, default=0.01, help="L2正则化系数")
+    parser.add_argument("--patience", type=int, default=10, help="Early Stopping 耐心值 (按ACC2)")
+    parser.add_argument("--warmup-epochs", type=int, default=5, help="Warmup 轮次")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="梯度裁剪阈值")
+
+    # --- 模型结构 ---
+    parser.add_argument("--d-model", type=int, default=256, help="Transformer 隐藏层维度")
+    parser.add_argument("--nhead", type=int, default=8, help="注意力头数")
+    parser.add_argument("--num-encoder-layers", type=int, default=4, help="Encoder 层数")
+    parser.add_argument("--num-decoder-layers", type=int, default=4, help="Decoder 层数")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout 比率")
+
+    # --- 混合 Loss 权重 ---
+    parser.add_argument("--lambda-mse", type=float, default=0, help="MSE Loss 权重")
+    parser.add_argument("--lambda-acc2", type=float, default=1, help="ACC2 Loss 权重")
+
+    args = parser.parse_args()
+
+    if args.mode in ["all", "preprocess"]:
+        print("\n[1/3] 数据预处理")
+        preprocess_main(csv_path=args.csv_path)
+
+    if args.mode in ["all", "train"]:
+        print("\n[2/3] 模型训练")
+        train(args)
+
+    if args.mode in ["all", "evaluate"]:
+        print("\n[3/3] 模型评估")
+        evaluate(args)
+
+
+if __name__ == "__main__":
+    main()
