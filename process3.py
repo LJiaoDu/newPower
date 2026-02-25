@@ -138,10 +138,11 @@ def load_site_df(path: str):
         # 复现 load_and_clean 核心逻辑（不重复读文件）
         import pandas as pd
         weather_cols = ["tsi", "dni", "ghi", "temp", "atm", "rh"]
+        numeric_cols = weather_cols + ["power"]
         df_raw["time"] = pd.to_datetime(df_raw["time"])
-        # 强制将天气列转为数值类型（xlsx 可能混有字符串如 "-"、"N/A" 等）
+        # 强制将所有数值列转为数值类型（xlsx 可能混有字符串如 "-"、"N/A" 等）
         # 使用 pd.to_numeric + errors="coerce" 将无法转换的值置为 NaN
-        for col in weather_cols:
+        for col in numeric_cols:
             df_raw[col] = pd.to_numeric(df_raw[col], errors="coerce")
         for col in weather_cols:
             n_bad = int((df_raw[col] == -99).sum())
