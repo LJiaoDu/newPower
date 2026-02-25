@@ -139,6 +139,9 @@ def load_site_df(path: str):
         import pandas as pd
         weather_cols = ["tsi", "dni", "ghi", "temp", "atm", "rh"]
         df_raw["time"] = pd.to_datetime(df_raw["time"])
+        # 强制将天气列转为数值类型（xlsx 可能混有字符串如 "-"、"N/A" 等）
+        for col in weather_cols:
+            df_raw[col] = pd.to_numeric(df_raw[col], errors="coerce")
         for col in weather_cols:
             n_bad = (df_raw[col] == -99).sum()
             if n_bad > 0:
