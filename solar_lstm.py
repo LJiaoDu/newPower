@@ -229,22 +229,22 @@ def print_metrics(y_true, y_pred, cap, label="评估结果"):
     print(f"  RMSE:             {rmse:.4f}  ({rmse*cap:.2f} MW)")
     print(f"  MAE:              {mae:.4f}  ({mae*cap:.2f} MW)")
 
-    # 按时间范围细分
-    steps_per_hour = 4
-    horizons = [
-        (0,  steps_per_hour,     "0-1h"),
-        (steps_per_hour,   2*steps_per_hour, "1-2h"),
-        (2*steps_per_hour, 3*steps_per_hour, "2-3h"),
-        (3*steps_per_hour, 4*steps_per_hour, "3-4h"),
-    ]
-    print(f"\n  按预测时间范围:")
-    for s, e, name in horizons:
-        yt = y_true[:, s:e]
-        yp = y_pred[:, s:e]
+    # 按16个预测点逐一细分 (每点15分钟)
+    print(f"\n  按16个预测点 (每点15分钟):")
+    for i in range(16):
+        yt = y_true[:, i:i+1]
+        yp = y_pred[:, i:i+1]
         h_acc1 = calc_acc1(yt, yp, cap)
         h_acc2 = calc_acc2(yt, yp, cap)
         h_rmse = calc_rmse(yt, yp, cap)
-        print(f"    {name}: ACC1={h_acc1:.4f}, ACC2={h_acc2:.4f}, RMSE={h_rmse*cap:.2f} MW")
+        total_min = (i + 1) * 15
+        if total_min % 60 == 0:
+            time_label = f"+{total_min // 60}h"
+        else:
+            h = total_min // 60
+            m = total_min % 60
+            time_label = f"+{h}h{m:02d}m" if h > 0 else f"+{m}min"
+        print(f"    点{i+1:2d} ({time_label:>7s}): ACC1={h_acc1:.4f}, ACC2={h_acc2:.4f}, RMSE={h_rmse*cap:.2f} MW")
     print(f"{'='*60}")
     return acc1, acc2, rmse, mae
 
