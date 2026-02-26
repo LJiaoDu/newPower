@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 # =====================================================================
 # 数据预处理
@@ -424,11 +425,14 @@ def train(args):
     print(f"开始训练 | Epochs={args.epochs} | BatchSize={args.batch_size} | LR={args.lr}")
     print(f"{'='*70}\n")
 
-    for epoch in range(args.epochs):
+    epoch_bar = tqdm(range(args.epochs), desc="训练进度", unit="epoch")
+    for epoch in epoch_bar:
         # --- 训练 ---
         model.train()
         train_loss = 0.0
-        for batch_enc, batch_dec, batch_y in train_loader:
+        train_bar = tqdm(train_loader, desc=f"  Ep{epoch+1:3d} 训练",
+                         leave=False, unit="batch")
+        for batch_enc, batch_dec, batch_y in train_bar:
             batch_enc = batch_enc.to(device)
             batch_dec = batch_dec.to(device)
             batch_y   = batch_y.to(device)
@@ -440,6 +444,7 @@ def train(args):
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
             train_loss += loss.item()
+            train_bar.set_postfix(loss=f"{loss.item():.4f}")
         train_loss /= len(train_loader)
 
         # --- 验证 ---
@@ -447,13 +452,17 @@ def train(args):
         val_loss  = 0.0
         all_preds = []
         all_trues = []
+        val_bar = tqdm(val_loader, desc=f"  Ep{epoch+1:3d} 验证",
+                       leave=False, unit="batch")
         with torch.no_grad():
-            for batch_enc, batch_dec, batch_y in val_loader:
+            for batch_enc, batch_dec, batch_y in val_bar:
                 batch_enc = batch_enc.to(device)
                 batch_dec = batch_dec.to(device)
                 batch_y   = batch_y.to(device)
                 pred = model(batch_enc, batch_dec)
-                val_loss += criterion(pred, batch_y).item()
+                batch_val_loss = criterion(pred, batch_y).item()
+                val_loss += batch_val_loss
+                val_bar.set_postfix(loss=f"{batch_val_loss:.4f}")
                 all_preds.append(pred.cpu().numpy())
                 all_trues.append(batch_y.cpu().numpy())
         val_loss /= len(val_loader)
@@ -467,7 +476,10 @@ def train(args):
         mae  = calc_mae(all_trues,  all_preds, cap)
         lr   = optimizer.param_groups[0]["lr"]
 
-        print(
+        epoch_bar.set_postfix(
+            val=f"{val_loss:.4f}", acc2=f"{acc2:.4f}", best=f"{best_val_loss:.4f}"
+        )
+        tqdm.write(
             f"Epoch {epoch+1:3d}/{args.epochs} | LR: {lr:.6f} | "
             f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
             f"ACC1: {acc1:.4f} | ACC2: {acc2:.4f} | "
@@ -487,11 +499,11 @@ def train(args):
                 "norm_params":      norm_params,
                 "args":             vars(args),
             }, "lstm_checkpoints/best_model_lstm.pth")
-            print(f"  -> 保存最佳模型 (val_loss={val_loss:.6f})")
+            tqdm.write(f"  -> 保存最佳模型 (val_loss={val_loss:.6f})")
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
-                print(f"\nEarly stopping: {args.patience} epochs 无改善")
+                tqdm.write(f"\nEarly stopping: {args.patience} epochs 无改善")
                 break
 
         scheduler.step()
