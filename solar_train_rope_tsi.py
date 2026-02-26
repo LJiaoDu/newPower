@@ -369,25 +369,21 @@ def evaluate(args):
     print(f"  RMSE:             {rmse:.2f} MW")
     print(f"  MAE:              {mae:.2f} MW")
 
-    # 按预测时间范围分析
-    steps_per_hour = 4
-    horizons = [
-        (0, steps_per_hour, "0-1h"),
-        (steps_per_hour, 2 * steps_per_hour, "1-2h"),
-        (2 * steps_per_hour, 3 * steps_per_hour, "2-3h"),
-        (3 * steps_per_hour, 4 * steps_per_hour, "3-4h"),
-    ]
-
-    print(f"\n按预测时间范围:")
-    for start, end, name in horizons:
-        yt = all_targets[:, start:end]
-        yp = all_preds[:, start:end]
-        h_acc1 = calc_acc_mae(yt, yp, cap)
-        h_acc2 = calc_acc2(yt, yp, cap)
-        h_rmse = calc_rmse(yt, yp, cap)
-        h_mae = calc_mae(yt, yp, cap)
-        print(f"  {name}: ACC1={h_acc1:.4f}, ACC2={h_acc2:.4f}, "
-              f"RMSE={h_rmse:.2f} MW, MAE={h_mae:.2f} MW")
+    # 逐点分析 16 个预测步
+    num_steps = all_targets.shape[1]
+    print(f"\n按预测步 (每步15分钟, 共{num_steps}步):")
+    print(f"  {'步':>3s}  {'时刻':>7s}  {'ACC1':>7s}  {'ACC2':>7s}  {'RMSE(MW)':>9s}  {'MAE(MW)':>8s}")
+    print(f"  {'-'*3}  {'-'*7}  {'-'*7}  {'-'*7}  {'-'*9}  {'-'*8}")
+    for step in range(num_steps):
+        yt = all_targets[:, step:step+1]
+        yp = all_preds[:, step:step+1]
+        s_acc1 = calc_acc_mae(yt, yp, cap)
+        s_acc2 = calc_acc2(yt, yp, cap)
+        s_rmse = calc_rmse(yt, yp, cap)
+        s_mae = calc_mae(yt, yp, cap)
+        minutes = (step + 1) * 15
+        time_label = f"+{minutes}min"
+        print(f"  {step+1:3d}  {time_label:>7s}  {s_acc1:.4f}  {s_acc2:.4f}  {s_rmse:9.2f}  {s_mae:8.2f}")
 
     print(f"{'='*60}")
 
