@@ -734,6 +734,15 @@ def get_args():
                    help='混合Loss中 MSE 的权重')
     p.add_argument('--lambda-acc2',       type=float, default=1.0,
                    help='混合Loss中 ACC2Loss 的权重')
+    # ---- 模型结构 ----
+    p.add_argument('--nhead',             type=int,   default=8,
+                   help='多头注意力头数（须能整除 hidden-feat-size）')
+    p.add_argument('--num-enc-layers',    type=int,   default=6,
+                   help='Transformer Encoder 层数')
+    p.add_argument('--num-cross-layers',  type=int,   default=3,
+                   help='Cross-Attention 层数')
+    p.add_argument('--ffn-multiplier',    type=int,   default=4,
+                   help='FFN 隐层宽度倍数（ffn_dim = hidden × multiplier）')
     return p.parse_args()
 
 

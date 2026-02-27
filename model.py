@@ -45,13 +45,17 @@ class ImprovedTFMModel(nn.Module):
     def __init__(self, cfg, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        self.in_feat_size = cfg.in_feat_size  # 11 (10时间 + 1功率)
-        self.out_feat_size = cfg.out_feat_size  # 1 (功率)
-        self.in_seq_len = cfg.in_seq_len  # 240
-        self.out_seq_len = cfg.out_seq_len  # 48
-        self.hidden_feat_size = cfg.hidden_feat_size  # 256
-        self.nhead = 8
-        self.rope_base = 10000.0
+        self.in_feat_size     = cfg.in_feat_size
+        self.out_feat_size    = cfg.out_feat_size
+        self.in_seq_len       = cfg.in_seq_len
+        self.out_seq_len      = cfg.out_seq_len
+        self.hidden_feat_size = cfg.hidden_feat_size
+        self.nhead            = cfg.nhead
+        self.rope_base        = 10000.0
+
+        num_enc_layers   = cfg.num_enc_layers
+        num_cross_layers = cfg.num_cross_layers
+        ffn_dim          = self.hidden_feat_size * cfg.ffn_multiplier
 
         # ========== Encoder: 处理历史序列 ==========
         self.input_projection = nn.Linear(self.in_feat_size, self.hidden_feat_size)
@@ -59,22 +63,19 @@ class ImprovedTFMModel(nn.Module):
         encoder_layer = EncoderLayer(
             d_model=self.hidden_feat_size,
             nhead=self.nhead,
-            dim_feedforward=self.hidden_feat_size * 4,
+            dim_feedforward=ffn_dim,
             dropout=0.1,
             batch_first=True
         )
         encoder_norm = LayerNorm(self.hidden_feat_size)
-        self.encoder = Encoder(encoder_layer, num_layers=6, norm=encoder_norm)
+        self.encoder = Encoder(encoder_layer, num_layers=num_enc_layers, norm=encoder_norm)
 
         # ========== 可学习的Query Embeddings（关键改进！） ==========
-        # 不再从零向量开始，而是学习48个不同的query
-        # 每个query代表一个未来时间步的"问题"
         self.future_queries = nn.Parameter(
             torch.randn(1, self.out_seq_len, self.hidden_feat_size) * 0.02
         )
 
         # ========== Cross-Attention Layers ==========
-        # Query通过cross-attention从encoder输出中提取信息
         self.cross_attention_layers = nn.ModuleList([
             nn.MultiheadAttention(
                 embed_dim=self.hidden_feat_size,
@@ -82,28 +83,28 @@ class ImprovedTFMModel(nn.Module):
                 dropout=0.1,
                 batch_first=True
             )
-            for _ in range(3)  # 3层cross-attention足够
+            for _ in range(num_cross_layers)
         ])
 
         # Layer Norms
         self.cross_attn_norms = nn.ModuleList([
-            LayerNorm(self.hidden_feat_size) for _ in range(3)
+            LayerNorm(self.hidden_feat_size) for _ in range(num_cross_layers)
         ])
 
         # Feed-Forward Networks
         self.ffns = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(self.hidden_feat_size, self.hidden_feat_size * 4),
+                nn.Linear(self.hidden_feat_size, ffn_dim),
                 nn.GELU(),
                 nn.Dropout(0.1),
-                nn.Linear(self.hidden_feat_size * 4, self.hidden_feat_size),
+                nn.Linear(ffn_dim, self.hidden_feat_size),
                 nn.Dropout(0.1)
             )
-            for _ in range(3)
+            for _ in range(num_cross_layers)
         ])
 
         self.ffn_norms = nn.ModuleList([
-            LayerNorm(self.hidden_feat_size) for _ in range(3)
+            LayerNorm(self.hidden_feat_size) for _ in range(num_cross_layers)
         ])
 
         self.output_projection = nn.Sequential(
