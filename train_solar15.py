@@ -550,10 +550,10 @@ def train_val(cfg):
         model.load_state_dict(ckpt['model_state_dict'])
 
         model.eval()
-        test_loss = 0.0
-        sum_mae = sum_acc_mae = sum_acc_rmse = 0.0
-        valid_cnt = 0
-        all_true, all_pred = [], []
+        test_loss  = 0.0
+        # 按步收集原始值：[N, 16]
+        all_true_steps = []   # list of [B, 16] numpy
+        all_pred_steps = []   # list of [B, 16] numpy
 
         with torch.no_grad():
             pbar = tqdm(test_loader, desc="[Test]  ", ncols=110)
@@ -567,47 +567,69 @@ def train_val(cfg):
                 loss      = loss_fn(pred_norm, fut_norm)
                 test_loss += loss.item()
 
-                fut_kw  = fut
-                pred_kw = pred_norm * cap
+                all_true_steps.append(fut.cpu().numpy())               # [B, 16] kW
+                all_pred_steps.append((pred_norm * cap).cpu().numpy()) # [B, 16] kW
 
-                mask = fut_kw > 0.2
-                if mask.sum() > 0:
-                    ft = fut_kw[mask].cpu().numpy()
-                    pp = pred_kw[mask].cpu().numpy()
+        test_loss /= len(test_loader)
 
-                    all_true.extend(ft.tolist())
-                    all_pred.extend(pp.tolist())
+        # 拼成 [N, 16]
+        true_mat = np.concatenate(all_true_steps, axis=0)   # [N, 16]
+        pred_mat = np.concatenate(all_pred_steps, axis=0)   # [N, 16]
 
-                    mae  = float(np.mean(np.abs(pp - ft)))
-                    rmse = float(np.sqrt(np.mean((pp - ft) ** 2)))
+        OUT_LEN = true_mat.shape[1]   # 16
 
-                    sum_mae      += mae
-                    sum_acc_mae  += max(0.0, min(1.0, 1.0 - mae  / (global_avg + 1e-6)))
-                    sum_acc_rmse += max(0.0, min(1.0, 1.0 - rmse / (global_avg + 1e-6)))
-                    valid_cnt    += 1
+        # ---- 逐步指标 ----
+        step_mae      = np.zeros(OUT_LEN)
+        step_acc_mae  = np.zeros(OUT_LEN)
+        step_acc_rmse = np.zeros(OUT_LEN)
+        step_acc2     = np.zeros(OUT_LEN)
 
-        test_loss    /= len(test_loader)
-        test_mae      = sum_mae      / max(valid_cnt, 1)
-        test_acc_mae  = sum_acc_mae  / max(valid_cnt, 1)
-        test_acc_rmse = sum_acc_rmse / max(valid_cnt, 1)
+        for s in range(OUT_LEN):
+            t = true_mat[:, s]   # [N]
+            p = pred_mat[:, s]   # [N]
+            mask = t > 0.2       # 有效发电时段
+            if mask.sum() == 0:
+                step_mae[s] = step_acc_mae[s] = step_acc_rmse[s] = step_acc2[s] = float('nan')
+                continue
+            tf, pf = t[mask], p[mask]
+            mae  = float(np.mean(np.abs(pf - tf)))
+            rmse = float(np.sqrt(np.mean((pf - tf) ** 2)))
+            step_mae[s]      = mae
+            step_acc_mae[s]  = max(0.0, min(1.0, 1.0 - mae  / (global_avg + 1e-6)))
+            step_acc_rmse[s] = max(0.0, min(1.0, 1.0 - rmse / (global_avg + 1e-6)))
+            step_acc2[s]     = calc_acc2(tf, pf, cap=cap)
 
-        if len(all_true) > 0:
-            test_acc2 = calc_acc2(
-                np.array(all_true, dtype=np.float32),
-                np.array(all_pred, dtype=np.float32),
-                cap=cap
-            )
-        else:
-            test_acc2 = float('nan')
+        # ---- 整体指标（所有步展平）----
+        mask_all  = true_mat > 0.2
+        tf_all    = true_mat[mask_all]
+        pf_all    = pred_mat[mask_all]
+        overall_mae      = float(np.mean(np.abs(pf_all - tf_all)))
+        overall_rmse     = float(np.sqrt(np.mean((pf_all - tf_all) ** 2)))
+        overall_acc_mae  = max(0.0, min(1.0, 1.0 - overall_mae  / (global_avg + 1e-6)))
+        overall_acc_rmse = max(0.0, min(1.0, 1.0 - overall_rmse / (global_avg + 1e-6)))
+        overall_acc2     = calc_acc2(tf_all, pf_all, cap=cap)
 
+        # ---- 打印 ----
         print(f"\n{'='*80}")
-        print("测试集最终结果（最佳模型）")
+        print("测试集最终结果（最佳模型）— 逐步指标")
         print(f"{'='*80}")
-        print(f"  Test  Loss   : {test_loss:.6f}")
-        print(f"  Test  MAE    : {test_mae:.4f} kW")
-        print(f"  ACC_MAE      : {test_acc_mae:.4f}  ({test_acc_mae*100:.2f}%)")
-        print(f"  ACC_RMSE     : {test_acc_rmse:.4f}  ({test_acc_rmse*100:.2f}%)")
-        print(f"  ACC2 (国标)  : {test_acc2:.4f}  ({test_acc2*100:.2f}%)")
+        print(f"  Test Loss : {test_loss:.6f}")
+        print()
+        print(f"  {'步':>3}  {'时间':>6}  {'MAE(kW)':>8}  {'ACC_MAE':>8}  {'ACC_RMSE':>9}  {'ACC2':>8}")
+        print(f"  {'-'*3}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*9}  {'-'*8}")
+        for s in range(OUT_LEN):
+            t_min = (s + 1) * 15
+            print(f"  {s+1:>3}  {t_min:>4}min"
+                  f"  {step_mae[s]:>8.4f}"
+                  f"  {step_acc_mae[s]:>7.2%}"
+                  f"  {step_acc_rmse[s]:>8.2%}"
+                  f"  {step_acc2[s]:>7.2%}")
+        print(f"  {'-'*3}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*9}  {'-'*8}")
+        print(f"  {'均值':>3}  {'  ALL':>6}"
+              f"  {overall_mae:>8.4f}"
+              f"  {overall_acc_mae:>7.2%}"
+              f"  {overall_acc_rmse:>8.2%}"
+              f"  {overall_acc2:>7.2%}")
         print(f"{'='*80}\n")
 
 
