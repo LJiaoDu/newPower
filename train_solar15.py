@@ -142,10 +142,17 @@ class SolarDataset15min(Dataset):
     def __init__(self, df: pd.DataFrame, weather_stats: dict, phase: str = 'train'):
         super().__init__()
 
-        # ---------- 时间序列 80/20 切分 ----------
-        split = int(len(df) * 0.8)
-        sub   = df.iloc[:split] if phase == 'train' else df.iloc[split:]
-        sub   = sub.reset_index(drop=True)
+        # ---------- 时间序列 70/15/15 切分 ----------
+        n       = len(df)
+        n_train = int(n * 0.70)
+        n_val   = int(n * 0.85)   # 70%~85% 为验证集，85%~100% 为测试集
+        if phase == 'train':
+            sub = df.iloc[:n_train]
+        elif phase == 'val':
+            sub = df.iloc[n_train:n_val]
+        else:                      # phase == 'test'
+            sub = df.iloc[n_val:]
+        sub = sub.reset_index(drop=True)
 
         cap_val = float(df['cap'].iloc[0])   # 50 kW
 
@@ -250,13 +257,14 @@ def train_val(cfg):
     if cfg.subset < 1.0:
         df = df.iloc[:int(len(df) * cfg.subset)].reset_index(drop=True)
 
-    # 用训练集（前80%）统计气象归一化参数
-    split_n       = int(len(df) * 0.8)
+    # 用训练集（前70%）统计气象归一化参数
+    split_n       = int(len(df) * 0.70)
     train_df_full = df.iloc[:split_n]
     _, weather_stats = normalize_weather(train_df_full)
 
     train_ds = SolarDataset15min(df, weather_stats, phase='train')
     val_ds   = SolarDataset15min(df, weather_stats, phase='val')
+    test_ds  = SolarDataset15min(df, weather_stats, phase='test')
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
@@ -264,6 +272,10 @@ def train_val(cfg):
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=True
     )
 
@@ -318,6 +330,7 @@ def train_val(cfg):
 
     # ---------- 早停 ----------
     best_val_loss = float('inf')
+    best_ckpt_path = ''
     patience_cnt  = 0
     patience      = 3
     start_epoch   = 0
@@ -505,9 +518,10 @@ def train_val(cfg):
         torch.save(ckpt_data, f'./checkpoint/ckpt_epoch{ep}.pth')
 
         if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_cnt  = 0
-            torch.save(ckpt_data, f'./checkpoint/best_epoch{ep}.pth')
+            best_val_loss  = val_loss
+            best_ckpt_path = f'./checkpoint/best_epoch{ep}.pth'
+            patience_cnt   = 0
+            torch.save(ckpt_data, best_ckpt_path)
             print(f"  ✓ 保存最佳模型  val_loss={val_loss:.6f}\n")
         else:
             patience_cnt += 1
@@ -526,6 +540,75 @@ def train_val(cfg):
     print("训练完成！")
     print(f"最佳 val_loss : {best_val_loss:.6f}")
     print("=" * 80)
+
+    # ============================================================
+    # 测试集评估（加载最佳模型，跑一次 test_loader）
+    # ============================================================
+    if best_ckpt_path and os.path.exists(best_ckpt_path):
+        print(f"\n加载最佳模型: {best_ckpt_path}")
+        ckpt = torch.load(best_ckpt_path, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+
+        model.eval()
+        test_loss = 0.0
+        sum_mae = sum_acc_mae = sum_acc_rmse = 0.0
+        valid_cnt = 0
+        all_true, all_pred = [], []
+
+        with torch.no_grad():
+            pbar = tqdm(test_loader, desc="[Test]  ", ncols=110)
+            for hist, fut in pbar:
+                hist     = hist.to(device)
+                fut      = fut.to(device)
+                fut_norm = fut / cap
+
+                pred      = model(hist, None)
+                pred_norm = pred.squeeze(-1)
+                loss      = loss_fn(pred_norm, fut_norm)
+                test_loss += loss.item()
+
+                fut_kw  = fut
+                pred_kw = pred_norm * cap
+
+                mask = fut_kw > 0.2
+                if mask.sum() > 0:
+                    ft = fut_kw[mask].cpu().numpy()
+                    pp = pred_kw[mask].cpu().numpy()
+
+                    all_true.extend(ft.tolist())
+                    all_pred.extend(pp.tolist())
+
+                    mae  = float(np.mean(np.abs(pp - ft)))
+                    rmse = float(np.sqrt(np.mean((pp - ft) ** 2)))
+
+                    sum_mae      += mae
+                    sum_acc_mae  += max(0.0, min(1.0, 1.0 - mae  / (global_avg + 1e-6)))
+                    sum_acc_rmse += max(0.0, min(1.0, 1.0 - rmse / (global_avg + 1e-6)))
+                    valid_cnt    += 1
+
+        test_loss    /= len(test_loader)
+        test_mae      = sum_mae      / max(valid_cnt, 1)
+        test_acc_mae  = sum_acc_mae  / max(valid_cnt, 1)
+        test_acc_rmse = sum_acc_rmse / max(valid_cnt, 1)
+
+        if len(all_true) > 0:
+            test_acc2 = calc_acc2(
+                np.array(all_true, dtype=np.float32),
+                np.array(all_pred, dtype=np.float32),
+                cap=cap
+            )
+        else:
+            test_acc2 = float('nan')
+
+        print(f"\n{'='*80}")
+        print("测试集最终结果（最佳模型）")
+        print(f"{'='*80}")
+        print(f"  Test  Loss   : {test_loss:.6f}")
+        print(f"  Test  MAE    : {test_mae:.4f} kW")
+        print(f"  ACC_MAE      : {test_acc_mae:.4f}  ({test_acc_mae*100:.2f}%)")
+        print(f"  ACC_RMSE     : {test_acc_rmse:.4f}  ({test_acc_rmse*100:.2f}%)")
+        print(f"  ACC2 (国标)  : {test_acc2:.4f}  ({test_acc2*100:.2f}%)")
+        print(f"{'='*80}\n")
 
 
 # ============================================================
