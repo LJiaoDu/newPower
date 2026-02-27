@@ -274,6 +274,43 @@ class SolarDataset15min(Dataset):
 
 
 # ============================================================
+# 损失函数
+# ============================================================
+
+class ACC2Loss(nn.Module):
+    """
+    基于国标 ACC2 的损失函数
+    L = mean( ((pred - target) / max(target, 0.2 * cap_norm))^2 )
+    pred / target 均为归一化值（已除以 cap），故 cap_norm=1.0
+    """
+    def __init__(self, cap_norm=1.0):
+        super().__init__()
+        self.cap_norm = cap_norm
+
+    def forward(self, pred, target):
+        denom = torch.clamp(target, min=0.2 * self.cap_norm)
+        relative_error = (pred - target) / denom
+        return torch.mean(relative_error ** 2)
+
+
+class MixedLoss(nn.Module):
+    """
+    混合 Loss = lambda_mse * MSE + lambda_acc2 * ACC2Loss
+    """
+    def __init__(self, lambda_mse=1.0, lambda_acc2=1.0, cap_norm=1.0):
+        super().__init__()
+        self.lambda_mse  = lambda_mse
+        self.lambda_acc2 = lambda_acc2
+        self.mse_loss    = nn.MSELoss()
+        self.acc2_loss   = ACC2Loss(cap_norm=cap_norm)
+
+    def forward(self, pred, target):
+        l_mse  = self.mse_loss(pred, target)
+        l_acc2 = self.acc2_loss(pred, target)
+        return self.lambda_mse * l_mse + self.lambda_acc2 * l_acc2
+
+
+# ============================================================
 # 训练主函数
 # ============================================================
 
@@ -375,7 +412,9 @@ def train_val(cfg):
     )
 
     # ---------- 损失 / TensorBoard ----------
-    loss_fn   = nn.MSELoss()
+    loss_fn   = MixedLoss(lambda_mse=cfg.lambda_mse,
+                          lambda_acc2=cfg.lambda_acc2,
+                          cap_norm=1.0)   # pred/target 已归一化，cap_norm=1
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     writer    = SummaryWriter(log_dir=f"runs/solar15min_{timestamp}")
     log_print(f"TensorBoard 日志: runs/solar15min_{timestamp}")
@@ -690,7 +729,11 @@ def get_args():
                    help='CosineAnnealingLR 的 T_max')
     p.add_argument('--patience',          type=int,   default=10,
                    help='早停耐心值：连续 N 轮 val_loss 无改善则停止')
-
+    # ---- 混合损失权重 ----
+    p.add_argument('--lambda-mse',        type=float, default=1.0,
+                   help='混合Loss中 MSE 的权重')
+    p.add_argument('--lambda-acc2',       type=float, default=1.0,
+                   help='混合Loss中 ACC2Loss 的权重')
     return p.parse_args()
 
 
