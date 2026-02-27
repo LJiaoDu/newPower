@@ -288,10 +288,10 @@ def train_val(cfg):
     # ---------- 模型 ----------
     model = Model(cfg).to(device)
 
-    # 调整所有 Dropout → 0.25
+    # 调整所有 Dropout
     for _, m in model.named_modules():
         if isinstance(m, nn.Dropout):
-            m.p = 0.25
+            m.p = cfg.dropout
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"模型参数量  : {total_params:,}\n")
@@ -308,19 +308,18 @@ def train_val(cfg):
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr_init,
-        weight_decay=0.04,
+        weight_decay=cfg.weight_decay,
         betas=(0.9, 0.999)
     )
 
-    warmup_epochs = 2
     scheduler = SequentialLR(
         optimizer,
         schedulers=[
             LinearLR(optimizer, start_factor=0.1, end_factor=1.0,
-                     total_iters=warmup_epochs),
-            CosineAnnealingLR(optimizer, T_max=30, eta_min=cfg.lr_final),
+                     total_iters=cfg.warmup_epochs),
+            CosineAnnealingLR(optimizer, T_max=cfg.t_max, eta_min=cfg.lr_final),
         ],
-        milestones=[warmup_epochs]
+        milestones=[cfg.warmup_epochs]
     )
 
     # ---------- 损失 / TensorBoard ----------
@@ -329,11 +328,11 @@ def train_val(cfg):
     writer    = SummaryWriter(log_dir=f'runs/solar15min_{timestamp}')
 
     # ---------- 早停 ----------
-    best_val_loss = float('inf')
+    best_val_loss  = float('inf')
     best_ckpt_path = ''
-    patience_cnt  = 0
-    patience      = 3
-    start_epoch   = 0
+    patience_cnt   = 0
+    patience       = cfg.patience
+    start_epoch    = 0
 
     # ---------- 断点续训 ----------
     if cfg.resume:
@@ -668,6 +667,17 @@ def get_args():
     p.add_argument('--hidden-feat-size',  type=int,   default=256)
     p.add_argument('--subset',            type=float, default=1.0)
     p.add_argument('--resume',            type=str,   default='')
+    # ---- 训练超参数 ----
+    p.add_argument('--dropout',           type=float, default=0.25,
+                   help='所有 Dropout 层的丢弃率')
+    p.add_argument('--weight-decay',      type=float, default=0.04,
+                   help='AdamW 权重衰减')
+    p.add_argument('--warmup-epochs',     type=int,   default=2,
+                   help='线性预热轮数')
+    p.add_argument('--t-max',             type=int,   default=50,
+                   help='CosineAnnealingLR 半周期轮数')
+    p.add_argument('--patience',          type=int,   default=10,
+                   help='早停耐心值：连续 N 轮 val_loss 无改善则停止')
     return p.parse_args()
 
 
