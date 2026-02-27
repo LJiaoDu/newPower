@@ -22,22 +22,67 @@ Solar Station 1 — 15分钟粒度训练脚本
   ACC2(国标) = 1 - sqrt( mean( ((P_M-P_P)/max(P_M, 0.2*Cap))^2 ) )
 """
 
+import os
+import time
+import argparse
+from datetime import datetime
+import atexit
+
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from model import ImprovedTFMModel as Model
+from torch.utils.tensorboard import SummaryWriter
+
 from tqdm import tqdm
-import argparse
-import os
-import csv
 import numpy as np
 import pandas as pd
-from torch.utils.tensorboard import SummaryWriter
-import time
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+
+# import matplotlib
+# matplotlib.use('Agg')
+# import matplotlib.pyplot as plt
+
+from model import ImprovedTFMModel as Model
+
+
+# =========================================================
+# 程序结束时保存“关键终端输出”到 txt（避免 tqdm 刷新残影写入）
+# =========================================================
+LOG_BUFFER = []
+
+def log_print(*args, **kwargs):
+    """
+    替代 print：正常打印到终端，同时把文本缓存起来，程序结束后写入 txt
+    """
+    sep = kwargs.get("sep", " ")
+    end = kwargs.get("end", "\n")
+    message = sep.join(str(a) for a in args) + end
+
+    print(*args, **kwargs)
+    LOG_BUFFER.append(message.rstrip("\n"))
+
+def log_tqdm_write(message: str):
+    """
+    替代 tqdm.write：写到终端（不破坏进度条），同时缓存
+    """
+    tqdm.write(str(message))
+    LOG_BUFFER.append(str(message))
+
+def save_log_to_file():
+    """
+    程序退出时，把 LOG_BUFFER 写入文件。
+    不会记录 tqdm 的动态刷新，只记录你显式输出的文本（log_print/log_tqdm_write）。
+    """
+    try:
+        os.makedirs("solar_logs", exist_ok=True)
+        time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"solar_logs/final_log_solar15min_{time_str}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(LOG_BUFFER) + "\n")
+        print(f"\n最终日志已保存至: {filename}")
+    except Exception as e:
+        print(f"\n[WARN] 保存最终日志失败: {e}")
+
+atexit.register(save_log_to_file)
 
 
 # ============================================================
@@ -56,6 +101,7 @@ def calc_acc2(y_true: np.ndarray, y_pred: np.ndarray, cap: float) -> float:
     p_p   = y_pred.flatten()
     denom = np.maximum(p_m, 0.2 * cap)
     return max(0.0, float(1.0 - np.sqrt(np.mean(((p_m - p_p) / denom) ** 2))))
+
 
 
 # ============================================================
@@ -154,7 +200,7 @@ class SolarDataset15min(Dataset):
             sub = df.iloc[n_val:]
         sub = sub.reset_index(drop=True)
 
-        cap_val = float(df['cap'].iloc[0])   # 50 kW
+        cap_val = float(df['cap'].iloc[0])
 
         self.cap           = cap_val
         self.power_max     = float(sub['power'].max())
@@ -168,11 +214,10 @@ class SolarDataset15min(Dataset):
         self.features = self._build_time_features(sub, weather_stats)  # [N, 17]
         self.targets  = sub['power'].values.astype(np.float32)          # [N]  原始 kW
 
-        print(f"[{phase:5s}] 样本数={len(sub)}  序列数={len(self)}"
-              f"  power: {self.power_min:.2f}~{self.power_max:.2f} kW"
-              f"  cap={self.cap} kW")
+        log_print(f"[{phase:5s}] 样本数={len(sub)}  序列数={len(self)}"
+                  f"  power: {self.power_min:.2f}~{self.power_max:.2f} kW"
+                  f"  cap={self.cap} kW")
 
-    # ----------------------------------------------------------
     def _build_time_features(self, sub: pd.DataFrame, weather_stats: dict) -> np.ndarray:
         hour      = sub['hour'].values.astype(np.float32)
         minute    = sub['minute'].values.astype(np.float32)
@@ -212,20 +257,19 @@ class SolarDataset15min(Dataset):
         for i in range(6):
             feats.append(weather[:, i])                             # 11~16
 
-        # ---- 1 个历史功率特征（归一化到 [0,1]，用 cap 做分母） ----
-        feats.append(power / (self.cap + 1e-8))                    # 17
+        # ---- 1 个历史功率特征 ----
+        feats.append(power / (self.cap + 1e-8))                      # 17
 
-        return np.stack(feats, axis=1).astype(np.float32)          # [N, 17]
+        return np.stack(feats, axis=1).astype(np.float32)
 
-    # ----------------------------------------------------------
     def __len__(self):
         return len(self.features) - self.IN_LEN - self.OUT_LEN
 
     def __getitem__(self, idx):
         s, m, e = idx, idx + self.IN_LEN, idx + self.IN_LEN + self.OUT_LEN
         return (
-            self.features[s:m],     # [80, 17]  历史特征
-            self.targets[m:e],      # [16]      未来功率（kW，原始值）
+            self.features[s:m],     # [80, 17]
+            self.targets[m:e],      # [16]  kW
         )
 
 
@@ -242,14 +286,19 @@ def train_val(cfg):
         os.environ['CUDA_VISIBLE_DEVICES'] = cfg.device
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    print("=" * 80)
-    print(f"设备        : {device}")
-    print(f"数据集      : {cfg.data_path}")
-    print(f"粒度        : 15 分钟")
-    print(f"输入序列    : {cfg.in_seq_len} 步（20h）")
-    print(f"预测序列    : {cfg.out_seq_len} 步（4h）")
-    print(f"输入特征    : {cfg.in_feat_size} 维（10时间 + 6气象 + 1功率）")
-    print("=" * 80 + "\n")
+    log_print("=" * 80)
+    log_print(f"Run started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log_print(f"Args: {vars(cfg)}")
+    log_print("=" * 80)
+
+    log_print("=" * 80)
+    log_print(f"设备        : {device}")
+    log_print(f"数据集      : {cfg.data_path}")
+    log_print(f"粒度        : 15 分钟")
+    log_print(f"输入序列    : {cfg.in_seq_len} 步（20h）")
+    log_print(f"预测序列    : {cfg.out_seq_len} 步（4h）")
+    log_print(f"输入特征    : {cfg.in_feat_size} 维（10时间 + 6气象 + 1功率）")
+    log_print("=" * 80 + "\n")
 
     # ---------- 数据预处理 ----------
     df = load_and_preprocess(cfg.data_path)
@@ -279,11 +328,11 @@ def train_val(cfg):
         num_workers=cfg.num_workers, pin_memory=True
     )
 
-    cap        = train_ds.cap               # 50 kW
-    global_avg = train_ds.global_avg_power  # kW
+    cap        = train_ds.cap
+    global_avg = train_ds.global_avg_power
 
-    print(f"\n装机容量    : {cap} kW")
-    print(f"全局均值    : {global_avg:.3f} kW  (有效发电时段 >0.2kW)\n")
+    log_print(f"\n装机容量    : {cap} kW")
+    log_print(f"全局均值    : {global_avg:.3f} kW  (有效发电时段 >0.2kW)\n")
 
     # ---------- 模型 ----------
     model = Model(cfg).to(device)
@@ -294,7 +343,7 @@ def train_val(cfg):
             m.p = cfg.dropout
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"模型参数量  : {total_params:,}\n")
+    log_print(f"模型参数量  : {total_params:,}\n")
 
     # Xavier 初始化
     def _init(m):
@@ -312,12 +361,15 @@ def train_val(cfg):
         betas=(0.9, 0.999)
     )
 
-    scheduler = SequentialLR(
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
         schedulers=[
-            LinearLR(optimizer, start_factor=0.1, end_factor=1.0,
-                     total_iters=cfg.warmup_epochs),
-            CosineAnnealingLR(optimizer, T_max=cfg.t_max, eta_min=cfg.lr_final),
+            torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.1, end_factor=1.0, total_iters=cfg.warmup_epochs
+            ),
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=cfg.t_max, eta_min=cfg.lr_final
+            ),
         ],
         milestones=[cfg.warmup_epochs]
     )
@@ -325,7 +377,8 @@ def train_val(cfg):
     # ---------- 损失 / TensorBoard ----------
     loss_fn   = nn.MSELoss()
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    writer    = SummaryWriter(log_dir=f'runs/solar15min_{timestamp}')
+    writer    = SummaryWriter(log_dir=f"runs/solar15min_{timestamp}")
+    log_print(f"TensorBoard 日志: runs/solar15min_{timestamp}")
 
     # ---------- 早停 ----------
     best_val_loss  = float('inf')
@@ -343,17 +396,17 @@ def train_val(cfg):
         start_epoch   = ckpt['epoch'] + 1
         best_val_loss = ckpt.get('val_loss', float('inf'))
         patience_cnt  = ckpt.get('patience_counter', 0)
-        print(f"断点续训    : epoch {start_epoch}，最佳 val_loss={best_val_loss:.6f}\n")
+        log_print(f"断点续训    : epoch {start_epoch}，最佳 val_loss={best_val_loss:.6f}\n")
 
-    os.makedirs('./checkpoint',       exist_ok=True)
-    os.makedirs('./prediction_plots', exist_ok=True)
+    os.makedirs("./checkpoint", exist_ok=True)
+    os.makedirs("./prediction_plots", exist_ok=True)
 
     # ============================================================
     # 训练循环
     # ============================================================
-    print("=" * 80)
-    print("开始训练...")
-    print("=" * 80 + "\n")
+    log_print("=" * 80)
+    log_print("开始训练...")
+    log_print("=" * 80 + "\n")
 
     for ep in range(start_epoch, cfg.epochs):
 
@@ -363,15 +416,13 @@ def train_val(cfg):
 
         pbar = tqdm(train_loader, desc=f"Ep {ep:3d} [Train]", ncols=110)
         for hist, fut in pbar:
-            # hist: [B, 80, 17]   fut: [B, 16] 原始 kW
             hist = hist.to(device)
             fut  = fut.to(device)
 
-            # 归一化 fut 以便和模型输出对齐（模型输出也在 [0,1] 空间）
             fut_norm = fut / cap
 
             optimizer.zero_grad()
-            pred = model(hist, None)                                 # [B, 16, 1]
+            pred = model(hist, None)  # [B, 16, 1]
             loss = loss_fn(pred.squeeze(-1), fut_norm)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -387,7 +438,7 @@ def train_val(cfg):
         val_loss = 0.0
         sum_mae = sum_acc_mae = sum_acc_rmse = 0.0
         valid_cnt = 0
-        all_true, all_pred = [], []         # 原始 kW，仅有效发电时段
+        all_true, all_pred = [], []
 
         with torch.no_grad():
             pbar = tqdm(val_loader, desc=f"Ep {ep:3d} [Val]  ", ncols=110)
@@ -396,16 +447,14 @@ def train_val(cfg):
                 fut      = fut.to(device)
                 fut_norm = fut / cap
 
-                pred      = model(hist, None)                        # [B, 16, 1]
+                pred      = model(hist, None)
                 pred_norm = pred.squeeze(-1)
                 loss      = loss_fn(pred_norm, fut_norm)
                 val_loss += loss.item()
 
-                # 还原到原始 kW
-                fut_kw  = fut                                        # [B, 16]
+                fut_kw  = fut
                 pred_kw = pred_norm * cap
 
-                # 只统计有效发电时段（>0.2 kW，排除夜间零值）
                 mask = fut_kw > 0.2
                 if mask.sum() > 0:
                     ft = fut_kw[mask].cpu().numpy()
@@ -429,76 +478,38 @@ def train_val(cfg):
         val_acc_mae   = sum_acc_mae  / max(valid_cnt, 1)
         val_acc_rmse  = sum_acc_rmse / max(valid_cnt, 1)
 
-        # ---------- ACC2（国标）----------
         if len(all_true) > 0:
-            arr_t    = np.array(all_true,  dtype=np.float32)
-            arr_p    = np.array(all_pred,  dtype=np.float32)
+            arr_t    = np.array(all_true, dtype=np.float32)
+            arr_p    = np.array(all_pred, dtype=np.float32)
             val_acc2 = calc_acc2(arr_t, arr_p, cap=cap)
         else:
             val_acc2 = float('nan')
 
         lr = optimizer.param_groups[0]['lr']
 
-        # ---------- 控制台输出 ----------
-        print(f"\n{'='*80}")
-        print(f"Epoch {ep:3d} | LR: {lr:.2e}")
-        print(f"{'='*80}")
-        print(f"  Train Loss   : {train_loss:.6f}")
-        print(f"  Val   Loss   : {val_loss:.6f}  (Gap {val_loss/train_loss:.2f}x)")
-        print(f"  Val   MAE    : {val_mae:.4f} kW")
-        print(f"  ACC_MAE      : {val_acc_mae:.4f}  ({val_acc_mae*100:.2f}%)")
-        print(f"  ACC_RMSE     : {val_acc_rmse:.4f}  ({val_acc_rmse*100:.2f}%)")
-        print(f"  ACC2 (国标)  : {val_acc2:.4f}  ({val_acc2*100:.2f}%)")
-        print(f"{'='*80}\n")
+        # ---------- 关键总结输出：写终端 + 写 txt ----------
+        log_tqdm_write(f"\n{'='*80}")
+        log_tqdm_write(f"Epoch {ep:3d} | LR: {lr:.2e}")
+        log_tqdm_write(f"{'='*80}")
+        log_tqdm_write(f"  Train Loss   : {train_loss:.6f}")
+        log_tqdm_write(f"  Val   Loss   : {val_loss:.6f}  (Gap {val_loss/(train_loss+1e-12):.2f}x)")
+        log_tqdm_write(f"  Val   MAE    : {val_mae:.4f} kW")
+        log_tqdm_write(f"  ACC_MAE      : {val_acc_mae:.4f}  ({val_acc_mae*100:.2f}%)")
+        log_tqdm_write(f"  ACC_RMSE     : {val_acc_rmse:.4f}  ({val_acc_rmse*100:.2f}%)")
+        log_tqdm_write(f"  ACC2 (国标)  : {val_acc2:.4f}  ({val_acc2*100:.2f}%)")
+        log_tqdm_write(f"{'='*80}\n")
 
         # ---------- TensorBoard ----------
         writer.add_scalar("Loss/train",      train_loss,   ep)
         writer.add_scalar("Loss/val",         val_loss,     ep)
-        writer.add_scalar("Loss/gap",         val_loss / train_loss, ep)
+        writer.add_scalar("Loss/gap",         val_loss / (train_loss + 1e-12), ep)
         writer.add_scalar("Metric/mae_kw",   val_mae,      ep)
         writer.add_scalar("Metric/acc_mae",  val_acc_mae,  ep)
         writer.add_scalar("Metric/acc_rmse", val_acc_rmse, ep)
-        writer.add_scalar("Metric/acc2",
-                          val_acc2 if not np.isnan(val_acc2) else 0.0, ep)
+        writer.add_scalar("Metric/acc2", 0.0 if np.isnan(val_acc2) else val_acc2, ep)
         writer.add_scalar("LearningRate",     lr,           ep)
 
-        # ---------- 预测曲线图 ----------
-        if len(all_true) > 0:
-            max_pts = 2000
-            if len(all_true) > max_pts:
-                idx_s = np.linspace(0, len(all_true) - 1, max_pts, dtype=int)
-                pt = [all_true[i] for i in idx_s]
-                pp = [all_pred[i] for i in idx_s]
-            else:
-                pt, pp = all_true, all_pred
-
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
-
-            ax1.plot(pt, 'b-', label='True',      alpha=0.7, linewidth=1.5)
-            ax1.plot(pp, 'r-', label='Predicted', alpha=0.7, linewidth=1.5)
-            ax1.set_title(
-                f"Epoch {ep}  |  ACC_MAE={val_acc_mae:.2%}  "
-                f"ACC2={val_acc2:.2%}  MAE={val_mae:.4f} kW",
-                fontsize=13
-            )
-            ax1.set_xlabel('样本索引'); ax1.set_ylabel('功率 (kW)')
-            ax1.legend(loc='upper right'); ax1.grid(alpha=0.3)
-
-            mn = min(min(pt), min(pp)); mx = max(max(pt), max(pp))
-            ax2.scatter(pt, pp, s=8, alpha=0.3, c='steelblue')
-            ax2.plot([mn, mx], [mn, mx], 'r--', lw=2, label='完美预测')
-            ax2.set_xlabel('真实值 (kW)'); ax2.set_ylabel('预测值 (kW)')
-            ax2.set_title('散点图：真实值 vs 预测值', fontsize=13)
-            ax2.legend(loc='upper left'); ax2.grid(alpha=0.3)
-            ax2.set_aspect('equal', adjustable='box')
-
-            plt.tight_layout()
-            plot_path = f'prediction_plots/epoch_{ep:03d}.png'
-            plt.savefig(plot_path, dpi=100, bbox_inches='tight')
-            writer.add_figure('Predictions/comparison', fig, ep)
-            plt.close(fig)
-            print(f"  预测图已保存: {plot_path}")
-
+       
         # ---------- Checkpoint ----------
         ckpt_data = {
             'epoch':                ep,
@@ -521,38 +532,37 @@ def train_val(cfg):
             best_ckpt_path = f'./checkpoint/best_epoch{ep}.pth'
             patience_cnt   = 0
             torch.save(ckpt_data, best_ckpt_path)
-            print(f"  ✓ 保存最佳模型  val_loss={val_loss:.6f}\n")
+            log_tqdm_write(f"  ✓ 保存最佳模型  val_loss={val_loss:.6f}\n")
         else:
             patience_cnt += 1
-            print(f"  早停计数: {patience_cnt}/{patience}\n")
+            log_tqdm_write(f"  早停计数: {patience_cnt}/{patience}\n")
             if patience_cnt >= patience:
-                print(f"{'='*80}")
-                print(f"早停触发（连续 {patience} epoch 无改善）")
-                print(f"最佳 val_loss: {best_val_loss:.6f}")
-                print(f"{'='*80}\n")
+                log_tqdm_write(f"{'='*80}")
+                log_tqdm_write(f"早停触发（连续 {patience} epoch 无改善）")
+                log_tqdm_write(f"最佳 val_loss: {best_val_loss:.6f}")
+                log_tqdm_write(f"{'='*80}\n")
                 break
 
         scheduler.step()
 
     writer.close()
-    print("\n" + "=" * 80)
-    print("训练完成！")
-    print(f"最佳 val_loss : {best_val_loss:.6f}")
-    print("=" * 80)
+    log_print("\n" + "=" * 80)
+    log_print("训练完成！")
+    log_print(f"最佳 val_loss : {best_val_loss:.6f}")
+    log_print("=" * 80)
 
     # ============================================================
     # 测试集评估（加载最佳模型，跑一次 test_loader）
     # ============================================================
     if best_ckpt_path and os.path.exists(best_ckpt_path):
-        print(f"\n加载最佳模型: {best_ckpt_path}")
+        log_print(f"\n加载最佳模型: {best_ckpt_path}")
         ckpt = torch.load(best_ckpt_path, map_location=device)
         model.load_state_dict(ckpt['model_state_dict'])
-
         model.eval()
+
         test_loss  = 0.0
-        # 按步收集原始值：[N, 16]
-        all_true_steps = []   # list of [B, 16] numpy
-        all_pred_steps = []   # list of [B, 16] numpy
+        all_true_steps = []
+        all_pred_steps = []
 
         with torch.no_grad():
             pbar = tqdm(test_loader, desc="[Test]  ", ncols=110)
@@ -571,22 +581,20 @@ def train_val(cfg):
 
         test_loss /= len(test_loader)
 
-        # 拼成 [N, 16]
         true_mat = np.concatenate(all_true_steps, axis=0)   # [N, 16]
         pred_mat = np.concatenate(all_pred_steps, axis=0)   # [N, 16]
+        out_len = true_mat.shape[1]
 
-        OUT_LEN = true_mat.shape[1]   # 16
+        # 逐步指标
+        step_mae      = np.zeros(out_len)
+        step_acc_mae  = np.zeros(out_len)
+        step_acc_rmse = np.zeros(out_len)
+        step_acc2     = np.zeros(out_len)
 
-        # ---- 逐步指标 ----
-        step_mae      = np.zeros(OUT_LEN)
-        step_acc_mae  = np.zeros(OUT_LEN)
-        step_acc_rmse = np.zeros(OUT_LEN)
-        step_acc2     = np.zeros(OUT_LEN)
-
-        for s in range(OUT_LEN):
-            t = true_mat[:, s]   # [N]
-            p = pred_mat[:, s]   # [N]
-            mask = t > 0.2       # 有效发电时段
+        for s in range(out_len):
+            t = true_mat[:, s]
+            p = pred_mat[:, s]
+            mask = t > 0.2
             if mask.sum() == 0:
                 step_mae[s] = step_acc_mae[s] = step_acc_rmse[s] = step_acc2[s] = float('nan')
                 continue
@@ -598,38 +606,38 @@ def train_val(cfg):
             step_acc_rmse[s] = max(0.0, min(1.0, 1.0 - rmse / (global_avg + 1e-6)))
             step_acc2[s]     = calc_acc2(tf, pf, cap=cap)
 
-        # ---- 整体指标（所有步展平）----
-        mask_all  = true_mat > 0.2
-        tf_all    = true_mat[mask_all]
-        pf_all    = pred_mat[mask_all]
-        overall_mae      = float(np.mean(np.abs(pf_all - tf_all)))
-        overall_rmse     = float(np.sqrt(np.mean((pf_all - tf_all) ** 2)))
+        # 整体（展平）
+        mask_all = true_mat > 0.2
+        tf_all = true_mat[mask_all]
+        pf_all = pred_mat[mask_all]
+        overall_mae  = float(np.mean(np.abs(pf_all - tf_all)))
+        overall_rmse = float(np.sqrt(np.mean((pf_all - tf_all) ** 2)))
         overall_acc_mae  = max(0.0, min(1.0, 1.0 - overall_mae  / (global_avg + 1e-6)))
         overall_acc_rmse = max(0.0, min(1.0, 1.0 - overall_rmse / (global_avg + 1e-6)))
         overall_acc2     = calc_acc2(tf_all, pf_all, cap=cap)
 
-        # ---- 打印 ----
-        print(f"\n{'='*80}")
-        print("测试集最终结果（最佳模型）— 逐步指标")
-        print(f"{'='*80}")
-        print(f"  Test Loss : {test_loss:.6f}")
-        print()
-        print(f"  {'步':>3}  {'时间':>6}  {'MAE(kW)':>8}  {'ACC_MAE':>8}  {'ACC_RMSE':>9}  {'ACC2':>8}")
-        print(f"  {'-'*3}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*9}  {'-'*8}")
-        for s in range(OUT_LEN):
+        # 打印（写入 txt）
+        log_print(f"\n{'='*80}")
+        log_print("测试集最终结果（最佳模型）— 逐步指标")
+        log_print(f"{'='*80}")
+        log_print(f"  Test Loss : {test_loss:.6f}")
+        log_print("")
+        log_print(f"  {'步':>3}  {'时间':>6}  {'MAE(kW)':>8}  {'ACC_MAE':>8}  {'ACC_RMSE':>9}  {'ACC2':>8}")
+        log_print(f"  {'-'*3}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*9}  {'-'*8}")
+        for s in range(out_len):
             t_min = (s + 1) * 15
-            print(f"  {s+1:>3}  {t_min:>4}min"
-                  f"  {step_mae[s]:>8.4f}"
-                  f"  {step_acc_mae[s]:>7.2%}"
-                  f"  {step_acc_rmse[s]:>8.2%}"
-                  f"  {step_acc2[s]:>7.2%}")
-        print(f"  {'-'*3}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*9}  {'-'*8}")
-        print(f"  {'均值':>3}  {'  ALL':>6}"
-              f"  {overall_mae:>8.4f}"
-              f"  {overall_acc_mae:>7.2%}"
-              f"  {overall_acc_rmse:>8.2%}"
-              f"  {overall_acc2:>7.2%}")
-        print(f"{'='*80}\n")
+            log_print(f"  {s+1:>3}  {t_min:>4}min"
+                      f"  {step_mae[s]:>8.4f}"
+                      f"  {step_acc_mae[s]:>7.2%}"
+                      f"  {step_acc_rmse[s]:>8.2%}"
+                      f"  {step_acc2[s]:>7.2%}")
+        log_print(f"  {'-'*3}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*9}  {'-'*8}")
+        log_print(f"  {'均值':>3}  {'  ALL':>6}"
+                  f"  {overall_mae:>8.4f}"
+                  f"  {overall_acc_mae:>7.2%}"
+                  f"  {overall_acc_rmse:>8.2%}"
+                  f"  {overall_acc2:>7.2%}")
+        log_print(f"{'='*80}\n")
 
 
 # ============================================================
@@ -655,18 +663,22 @@ def get_args():
     p.add_argument('--data-path',         type=str,   default='./solar_station_1.csv')
     p.add_argument('--lr-init',           type=float, default=0.0004)
     p.add_argument('--lr-final',          type=float, default=0.00001)
+
     # 15分钟粒度
     p.add_argument('--in-seq-len',        type=int,   default=80,
                    help='20h × 4步/h = 80')
     p.add_argument('--out-seq-len',       type=int,   default=16,
                    help=' 4h × 4步/h = 16')
+
     # 17维特征
     p.add_argument('--in-feat-size',      type=int,   default=17,
                    help='10时间 + 6气象 + 1功率')
     p.add_argument('--out-feat-size',     type=int,   default=1)
     p.add_argument('--hidden-feat-size',  type=int,   default=256)
+
     p.add_argument('--subset',            type=float, default=1.0)
     p.add_argument('--resume',            type=str,   default='')
+
     # ---- 训练超参数 ----
     p.add_argument('--dropout',           type=float, default=0.25,
                    help='所有 Dropout 层的丢弃率')
@@ -675,9 +687,10 @@ def get_args():
     p.add_argument('--warmup-epochs',     type=int,   default=2,
                    help='线性预热轮数')
     p.add_argument('--t-max',             type=int,   default=50,
-                   help='CosineAnnealingLR 半周期轮数')
+                   help='CosineAnnealingLR 的 T_max')
     p.add_argument('--patience',          type=int,   default=10,
                    help='早停耐心值：连续 N 轮 val_loss 无改善则停止')
+
     return p.parse_args()
 
 
