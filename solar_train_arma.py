@@ -474,10 +474,10 @@ def main():
                         help="solar_station_1.csv 文件路径")
 
     # --- ARMA 超参数 ---
-    parser.add_argument("--p", type=int, default=96,
-                        help="AR 阶数: 使用最近 p 步历史功率 (≤96)")
+    parser.add_argument("--p", type=int, default=72,
+                        help="AR 阶数: 使用最近 p 步历史功率 (≤96, 需满足 p+q ≤96)")
     parser.add_argument("--q", type=int, default=24,
-                        help="MA 阶数: 使用最近 q 步 AR 残差 (q+p ≤96)")
+                        help="MA 阶数: 使用最近 q 步 AR 残差 (q+p ≤96, 超出自动裁剪)")
     parser.add_argument("--d-hidden", type=int, default=128,
                         help="气象 MLP 隐层维度")
     parser.add_argument("--dropout", type=float, default=0.1,

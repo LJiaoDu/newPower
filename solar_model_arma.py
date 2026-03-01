@@ -90,7 +90,7 @@ class ARMAModel(nn.Module):
     """
 
     def __init__(self,
-                 p: int = 96,
+                 p: int = 72,
                  q: int = 24,
                  horizon: int = 16,
                  n_weather: int = 6,
@@ -102,12 +102,18 @@ class ARMAModel(nn.Module):
 
         assert p <= hist_len, \
             f"AR 阶 p={p} 不能超过历史长度 hist_len={hist_len}"
-        assert q + p <= hist_len, \
-            f"q={q} + p={p} 不能超过历史长度 hist_len={hist_len}, " \
-            f"请减小 q 或 p"
+
+        # MA 残差需要在历史窗口内滑动，自动裁剪 q 确保 q+p <= hist_len
+        effective_q = min(q, hist_len - p)
+        if effective_q < q:
+            import warnings
+            warnings.warn(
+                f"MA 阶 q={q} 超出可用范围 (hist_len={hist_len} - p={p}={hist_len-p}), "
+                f"自动裁剪为 q={effective_q}"
+            )
 
         self.p = p
-        self.q = q
+        self.q = effective_q
         self.horizon = horizon
 
         # --- AR 单步线性层 (用于计算 MA 所需的历史残差) ---
