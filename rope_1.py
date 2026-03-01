@@ -1,389 +1,485 @@
 #!/usr/bin/env python3
 """
-太阳能电站功率预测 - Encoder-Decoder Transformer + RoPE
+太阳能电站功率预测 - RoPE ED Transformer 训练脚本 v2 (改良版)
 
-改进点 (相比 solar_model.py):
-1. 用 RoPE (Rotary Position Encoding) 替代正弦位置编码
-2. RoPE 正确应用在 attention 的 Q/K 上, 而非 additive 加到输入
-3. 自定义 Encoder/Decoder Layer 以支持 RoPE 注入
-4. Cross-Attention 中 Q 用绝对续接位置 [96..111], K 用 [0..95], 编码时间距离
-
-架构:
-  Encoder: 历史24h (功率+气象+时间) [B, 96, 13] -> RoPE Self-Attention -> memory
-  Decoder: 未来4h  (气象+时间)      [B, 16, 12] -> RoPE Self-Attn + Cross-Attn -> 功率预测
+改良点 (相比 solar_train_rope.py):
+1. 缩小模型: d_model=128, nhead=4, enc_layers=3, dec_layers=2 → ~0.6M 参数, 抑制过拟合
+2. 加大正则: dropout=0.2, weight_decay=0.05
+3. 降低学习率: lr=1e-4, 减少 val loss 尖峰
+4. 保存标准改为 ACC2 最高 (而非 val_loss 最低), 与评估目标对齐
+5. 训练时输入噪声增强: 给 enc/dec 加微小高斯噪声, 抑制过拟合
+6. 调高 ACC2 Loss 权重: λ_acc2=1.0, 直接优化目标指标
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
-from typing import Optional, Tuple
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+import os
+import argparse
+import pickle
+import time
+from tqdm import tqdm
+
+from rope_model import SolarTransformerRoPE
+from solar_preprocess import main as preprocess_main
+
+from datetime import datetime
+import atexit
 
 
-# ============== RoPE 核心 ==============
+# =========================================================
+# 仅在程序结束时保存“关键终端输出”（避免 tqdm 进度条刷屏写入）
+# =========================================================
 
-class RotaryPositionEncoding(nn.Module):
+LOG_BUFFER = []
+
+def log_print(*args, **kwargs):
     """
-    预计算 RoPE 的 cos/sin 缓存表
-
-    head_dim 必须为偶数, 每 2 个维度组成一对做旋转
-    支持 offset 参数, 用于 cross-attention 时 Q 使用续接位置
+    替代 print：正常打印到终端，同时把文本缓存起来，程序结束后写入 txt
     """
+    sep = kwargs.get("sep", " ")
+    end = kwargs.get("end", "\n")
+    message = sep.join(str(a) for a in args) + end
 
-    def __init__(self, head_dim: int, max_len: int = 200, base: float = 10000.0):
+    print(*args, **kwargs)
+    LOG_BUFFER.append(message.rstrip("\n"))
+
+def log_tqdm_write(message: str):
+    """
+    替代 tqdm.write：写到终端（不破坏进度条），同时缓存
+    """
+    tqdm.write(message)
+    LOG_BUFFER.append(str(message))
+
+def save_log_to_file():
+    """
+    程序退出时，把 LOG_BUFFER 写入文件。
+    注意：不会记录 tqdm 的动态刷新，只记录你显式输出的文本（log_print / log_tqdm_write）。
+    """
+    try:
+        os.makedirs("solar_logs", exist_ok=True)
+        time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"solar_logs/final_log_rope_v2_{time_str}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(LOG_BUFFER) + "\n")
+        print(f"\n最终日志已保存至: {filename}")
+    except Exception as e:
+        print(f"\n[WARN] 保存最终日志失败: {e}")
+
+atexit.register(save_log_to_file)
+
+
+# ============== 混合 Loss ==============
+
+class ACC2Loss(nn.Module):
+    """
+    基于国标 ACC2 的损失函数
+    L = mean( ((pred - target) / max(target, 0.2 * cap_norm))^2 )
+    """
+    def __init__(self, cap_norm=1.0):
         super().__init__()
-        assert head_dim % 2 == 0, f"head_dim must be even, got {head_dim}"
+        self.cap_norm = cap_norm
 
-        # inv_freq: [head_dim/2]
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer("inv_freq", inv_freq)
+    def forward(self, pred, target):
+        denom = torch.clamp(target, min=0.2 * self.cap_norm)
+        relative_error = (pred - target) / denom
+        return torch.mean(relative_error ** 2)
 
-        # 预计算缓存
-        self._build_cache(max_len)
 
-    def _build_cache(self, max_len: int):
-        pos = torch.arange(0, max_len, dtype=torch.float32)
-        # freqs: [max_len, head_dim/2]
-        freqs = torch.outer(pos, self.inv_freq)
-        # emb: [max_len, head_dim]  (每对频率重复, 与 rotate_half 对应)
-        emb = torch.cat([freqs, freqs], dim=-1)
-        # [1, 1, max_len, head_dim] 方便广播到 [B, nhead, seq_len, head_dim]
-        cos_cached = emb.cos().unsqueeze(0).unsqueeze(0)
-        sin_cached = emb.sin().unsqueeze(0).unsqueeze(0)
-        self.register_buffer("cos_cached", cos_cached)
-        self.register_buffer("sin_cached", sin_cached)
+class MixedLoss(nn.Module):
+    """
+    混合 Loss = λ_mse * MSE + λ_acc2 * ACC2_Loss
+    """
+    def __init__(self, lambda_mse=1.0, lambda_acc2=1.0, cap_norm=1.0):
+        super().__init__()
+        self.lambda_mse = lambda_mse
+        self.lambda_acc2 = lambda_acc2
+        self.mse_loss = nn.MSELoss()
+        self.acc2_loss = ACC2Loss(cap_norm=cap_norm)
 
-    def forward(self, seq_len: int, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        返回 [1, 1, seq_len, head_dim] 的 cos/sin
+    def forward(self, pred, target):
+        l_mse = self.mse_loss(pred, target)
+        l_acc2 = self.acc2_loss(pred, target)
+        return self.lambda_mse * l_mse + self.lambda_acc2 * l_acc2
 
-        Args:
-            seq_len: 序列长度
-            offset: 位置偏移量 (cross-attention 时 Q 用 offset=enc_seq_len)
-        """
-        return (
-            self.cos_cached[:, :, offset:offset + seq_len, :],
-            self.sin_cached[:, :, offset:offset + seq_len, :],
+
+# ============== 评估指标 ==============
+
+def calc_acc_mae(y_true, y_pred, cap=1.0):
+    """ACC1 (MAE-based): 1 - MAE / mean(y_true)"""
+    mask = y_true > 0.01
+    if mask.sum() == 0:
+        return float("nan")
+    y_t = y_true[mask] * cap
+    y_p = y_pred[mask] * cap
+    mae = np.mean(np.abs(y_t - y_p))
+    avg = np.mean(y_t)
+    return max(0.0, 1.0 - mae / (avg + 1e-6))
+
+def calc_rmse(y_true, y_pred, cap=1.0):
+    return np.sqrt(np.mean((y_true * cap - y_pred * cap) ** 2))
+
+def calc_mae(y_true, y_pred, cap=1.0):
+    return np.mean(np.abs(y_true * cap - y_pred * cap))
+
+def calc_acc2(y_true, y_pred, cap=1.0):
+    """ACC2 (国标): 1 - sqrt( (1/N) * sum( ((P_M - P_P) / max(P_M, 0.2*Cap))^2 ) )"""
+    p_m = y_true.flatten() * cap
+    p_p = y_pred.flatten() * cap
+    denom = np.maximum(p_m, 0.2 * cap)
+    return max(0.0, 1.0 - np.sqrt(np.mean(((p_m - p_p) / denom) ** 2)))
+
+
+# ============== 训练 ==============
+
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log_print(f"设备: {device}")
+
+    # 加载数据 (不过滤夜间样本)
+    X_enc_train = np.load("X_enc_train.npy")
+    X_dec_train = np.load("X_dec_train.npy")
+    y_train = np.load("y_train.npy")
+    X_enc_val = np.load("X_enc_val.npy")
+    X_dec_val = np.load("X_dec_val.npy")
+    y_val = np.load("y_val.npy")
+
+    with open("norm_params.pkl", "rb") as f:
+        norm_params = pickle.load(f)
+    cap = norm_params["power"]["cap"]
+
+    log_print(f"训练集: enc={X_enc_train.shape}, dec={X_dec_train.shape}, y={y_train.shape}")
+    log_print(f"验证集: enc={X_enc_val.shape}, dec={X_dec_val.shape}, y={y_val.shape}")
+    log_print(f"标称容量: {cap} MW")
+
+    enc_seq_len = X_enc_train.shape[1]
+    enc_feat_size = X_enc_train.shape[2]
+    dec_seq_len = X_dec_train.shape[1]
+    dec_feat_size = X_dec_train.shape[2]
+
+    # DataLoader
+    train_loader = DataLoader(
+        TensorDataset(
+            torch.FloatTensor(X_enc_train),
+            torch.FloatTensor(X_dec_train),
+            torch.FloatTensor(y_train),
+        ),
+        batch_size=args.batch_size, shuffle=True,
+    )
+    val_loader = DataLoader(
+        TensorDataset(
+            torch.FloatTensor(X_enc_val),
+            torch.FloatTensor(X_dec_val),
+            torch.FloatTensor(y_val),
+        ),
+        batch_size=args.batch_size, shuffle=False,
+    )
+
+    # 模型
+    model = SolarTransformerRoPE(
+        enc_feat_size=enc_feat_size,
+        dec_feat_size=dec_feat_size,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        dim_feedforward=args.d_model * 4,
+        dropout=args.dropout,
+        enc_seq_len=enc_seq_len,
+        dec_seq_len=dec_seq_len,
+    ).to(device)
+
+    # Xavier 初始化
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p, gain=0.5)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    log_print(f"模型参数量: {total_params:,}")
+
+    # 优化器
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=args.warmup_epochs)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[args.warmup_epochs])
+
+    # Loss
+    criterion = MixedLoss(
+        lambda_mse=args.lambda_mse,
+        lambda_acc2=args.lambda_acc2,
+        cap_norm=1.0,
+    )
+
+    os.makedirs("solar_checkpoints", exist_ok=True)
+
+    # TensorBoard
+    log_dir = os.path.join("runs", f"rope_v2_{time.strftime('%Y%m%d_%H%M%S')}")
+    writer = SummaryWriter(log_dir=log_dir)
+    log_print(f"TensorBoard 日志: {log_dir}")
+
+    best_acc2 = -1.0
+    patience_counter = 0
+
+    log_print(f"\n{'='*70}")
+    log_print(f"开始训练 | Epochs: {args.epochs} | Batch: {args.batch_size} | LR: {args.lr}")
+    log_print(f"Loss: λ_mse={args.lambda_mse} * MSE + λ_acc2={args.lambda_acc2} * ACC2Loss")
+    log_print(f"模型: SolarTransformerRoPE | d_model={args.d_model}, heads={args.nhead}, "
+              f"enc_layers={args.num_encoder_layers}, dec_layers={args.num_decoder_layers}")
+    log_print(f"正则: dropout={args.dropout}, weight_decay={args.weight_decay}")
+    log_print(f"输入噪声: std={args.noise_std}")
+    log_print(f"保存标准: ACC2 最高")
+    log_print(f"{'='*70}\n")
+
+    epoch_bar = tqdm(range(args.epochs), desc="Training", unit="epoch")
+    for epoch in epoch_bar:
+        # --- 训练 ---
+        model.train()
+        train_loss = 0.0
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]",
+                         leave=False, unit="batch")
+        for batch_enc, batch_dec, batch_y in train_bar:
+            batch_enc = batch_enc.to(device)
+            batch_dec = batch_dec.to(device)
+            batch_y = batch_y.to(device)
+
+            if args.noise_std > 0:
+                batch_enc = batch_enc + torch.randn_like(batch_enc) * args.noise_std
+                batch_dec = batch_dec + torch.randn_like(batch_dec) * args.noise_std
+
+            optimizer.zero_grad()
+            pred = model(batch_enc, batch_dec)
+            loss = criterion(pred, batch_y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+            optimizer.step()
+            train_loss += loss.item()
+            train_bar.set_postfix(loss=f"{loss.item():.6f}")
+        train_loss /= len(train_loader)
+
+        # --- 验证 ---
+        model.eval()
+        val_loss = 0.0
+        all_preds, all_targets = [], []
+        val_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]",
+                       leave=False, unit="batch")
+        with torch.no_grad():
+            for batch_enc, batch_dec, batch_y in val_bar:
+                batch_enc = batch_enc.to(device)
+                batch_dec = batch_dec.to(device)
+                batch_y = batch_y.to(device)
+
+                pred = model(batch_enc, batch_dec)
+                val_loss += criterion(pred, batch_y).item()
+                all_preds.append(pred.cpu().numpy())
+                all_targets.append(batch_y.cpu().numpy())
+        val_loss /= len(val_loader)
+
+        all_preds = np.concatenate(all_preds)
+        all_targets = np.concatenate(all_targets)
+
+        acc1 = calc_acc_mae(all_targets, all_preds, cap)
+        acc2 = calc_acc2(all_targets, all_preds, cap)
+        rmse = calc_rmse(all_targets, all_preds, cap)
+        mae = calc_mae(all_targets, all_preds, cap)
+        lr = optimizer.param_groups[0]["lr"]
+
+        # TensorBoard
+        writer.add_scalars("Loss", {"Train": train_loss, "Val": val_loss}, epoch + 1)
+        writer.add_scalar("Accuracy/ACC1", acc1, epoch + 1)
+        writer.add_scalar("Accuracy/ACC2", acc2, epoch + 1)
+        writer.add_scalar("Error/RMSE_MW", rmse, epoch + 1)
+        writer.add_scalar("Error/MAE_MW", mae, epoch + 1)
+        writer.add_scalar("LearningRate", lr, epoch + 1)
+
+        epoch_bar.set_postfix(train=f"{train_loss:.5f}", val=f"{val_loss:.5f}",
+                              ACC1=f"{acc1:.4f}", ACC2=f"{acc2:.4f}")
+
+        # 关键：用 log_tqdm_write 记录每个 epoch 的“最终总结行”
+        log_tqdm_write(
+            f"Epoch {epoch+1:3d}/{args.epochs} | "
+            f"LR: {lr:.6f} | "
+            f"Train: {train_loss:.6f} | "
+            f"Val: {val_loss:.6f} | "
+            f"ACC1: {acc1:.4f} | "
+            f"ACC2: {acc2:.4f} | "
+            f"RMSE: {rmse:.2f} MW | "
+            f"MAE: {mae:.2f} MW"
         )
 
+        # 保存最佳模型 (按 ACC2 最高)
+        if acc2 > best_acc2:
+            best_acc2 = acc2
+            patience_counter = 0
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "val_loss": val_loss,
+                "acc1": acc1,
+                "acc2": acc2,
+                "norm_params": norm_params,
+                "args": vars(args),
+            }, "solar_checkpoints/best_model_rope_v2.pth")
+            log_tqdm_write(f"  -> 保存最佳模型 (ACC2: {acc2:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                log_tqdm_write(f"\nEarly stopping: {args.patience} epochs ACC2 无改善")
+                break
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """将 x 的前半和后半交换并取反后半, 用于 RoPE 旋转"""
-    x1 = x[..., :x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return torch.cat([-x2, x1], dim=-1)
+        scheduler.step()
 
-
-def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor,
-    cos_q: torch.Tensor, sin_q: torch.Tensor,
-    cos_k: torch.Tensor, sin_k: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    对 Q 和 K 分别应用 RoPE (V 不旋转)
-
-    Args:
-        q: [B, nhead, q_len, head_dim]
-        k: [B, nhead, k_len, head_dim]
-        cos_q/sin_q: [1, 1, q_len, head_dim]
-        cos_k/sin_k: [1, 1, k_len, head_dim]
-    """
-    q_rot = q * cos_q + rotate_half(q) * sin_q
-    k_rot = k * cos_k + rotate_half(k) * sin_k
-    return q_rot, k_rot
-
-
-# ============== 自定义多头注意力 (支持 RoPE) ==============
-
-class RoPEMultiheadAttention(nn.Module):
-    """
-    多头注意力, Q/K 投影后先应用 RoPE 再计算 attention
-
-    与 nn.MultiheadAttention 的区别:
-    - Q, K, V 使用独立的 Linear 投影 (参数量相同)
-    - forward 额外接收 cos_q, sin_q, cos_k, sin_k
-    """
-
-    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
-        super().__init__()
-        assert d_model % nhead == 0
-        self.d_model = d_model
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
-
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-
-        self.attn_dropout = nn.Dropout(dropout)
-        self.scale = math.sqrt(self.head_dim)
-
-    def forward(
-        self,
-        query: torch.Tensor,       # [B, q_len, d_model]
-        key: torch.Tensor,         # [B, k_len, d_model]
-        value: torch.Tensor,       # [B, k_len, d_model]
-        cos_q: torch.Tensor,       # [1, 1, q_len, head_dim]
-        sin_q: torch.Tensor,
-        cos_k: torch.Tensor,       # [1, 1, k_len, head_dim]
-        sin_k: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        B, q_len, _ = query.shape
-        k_len = key.shape[1]
-
-        # 投影
-        Q = self.q_proj(query).view(B, q_len, self.nhead, self.head_dim).transpose(1, 2)
-        K = self.k_proj(key).view(B, k_len, self.nhead, self.head_dim).transpose(1, 2)
-        V = self.v_proj(value).view(B, k_len, self.nhead, self.head_dim).transpose(1, 2)
-        # Q/K/V: [B, nhead, seq_len, head_dim]
-
-        # 应用 RoPE (仅 Q 和 K, V 不旋转)
-        Q, K = apply_rotary_pos_emb(Q, K, cos_q, sin_q, cos_k, sin_k)
-
-        # Scaled Dot-Product Attention
-        attn_weights = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        # attn_weights: [B, nhead, q_len, k_len]
-
-        if attn_mask is not None:
-            attn_weights = attn_weights + attn_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # 加权求和
-        out = torch.matmul(attn_weights, V)  # [B, nhead, q_len, head_dim]
-        out = out.transpose(1, 2).contiguous().view(B, q_len, self.d_model)
-
-        return self.out_proj(out)
+    writer.close()
+    log_print(f"\n训练完成! 最佳 ACC2: {best_acc2:.4f}")
 
 
-# ============== 自定义 Encoder/Decoder Layer ==============
+# ============== 评估 ==============
 
-class RoPEEncoderLayer(nn.Module):
-    """
-    Transformer Encoder Layer + RoPE
-    Post-LN 残差结构 (匹配 PyTorch 默认行为)
-    """
+def evaluate(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def __init__(self, d_model: int, nhead: int,
-                 dim_feedforward: int = 1024,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.self_attn = RoPEMultiheadAttention(d_model, nhead, dropout)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
-        self.activation = nn.GELU()
+    X_enc_test = np.load("X_enc_test.npy")
+    X_dec_test = np.load("X_dec_test.npy")
+    y_test = np.load("y_test.npy")
 
-    def forward(self, src: torch.Tensor,
-                cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            src: [B, seq_len, d_model]
-            cos/sin: [1, 1, seq_len, head_dim]
-        """
-        # Self-Attention + Residual + LayerNorm
-        src2 = self.self_attn(src, src, src, cos, sin, cos, sin)
-        src = self.norm1(src + self.dropout1(src2))
+    with open("norm_params.pkl", "rb") as f:
+        norm_params = pickle.load(f)
+    cap = norm_params["power"]["cap"]
 
-        # Feedforward + Residual + LayerNorm
-        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
-        src = self.norm2(src + self.dropout3(src2))
+    enc_feat_size = X_enc_test.shape[2]
+    dec_feat_size = X_dec_test.shape[2]
+    enc_seq_len = X_enc_test.shape[1]
+    dec_seq_len = X_dec_test.shape[1]
 
-        return src
+    model = SolarTransformerRoPE(
+        enc_feat_size=enc_feat_size,
+        dec_feat_size=dec_feat_size,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        dim_feedforward=args.d_model * 4,
+        dropout=args.dropout,
+        enc_seq_len=enc_seq_len,
+        dec_seq_len=dec_seq_len,
+    ).to(device)
+
+    checkpoint = torch.load("solar_checkpoints/best_model_rope_v2.pth",
+                            map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    log_print(f"加载模型: epoch={checkpoint['epoch']+1}, "
+              f"val_loss={checkpoint['val_loss']:.6f}, "
+              f"ACC2={checkpoint['acc2']:.4f}")
+
+    test_loader = DataLoader(
+        TensorDataset(
+            torch.FloatTensor(X_enc_test),
+            torch.FloatTensor(X_dec_test),
+            torch.FloatTensor(y_test),
+        ),
+        batch_size=args.batch_size, shuffle=False,
+    )
+
+    all_preds, all_targets = [], []
+    test_bar = tqdm(test_loader, desc="Testing", unit="batch")
+    with torch.no_grad():
+        for batch_enc, batch_dec, batch_y in test_bar:
+            batch_enc = batch_enc.to(device)
+            batch_dec = batch_dec.to(device)
+            pred = model(batch_enc, batch_dec)
+            all_preds.append(pred.cpu().numpy())
+            all_targets.append(batch_y.numpy())
+
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
+
+    acc1 = calc_acc_mae(all_targets, all_preds, cap)
+    acc2 = calc_acc2(all_targets, all_preds, cap)
+    rmse = calc_rmse(all_targets, all_preds, cap)
+    mae = calc_mae(all_targets, all_preds, cap)
+
+    log_print(f"\n{'='*60}")
+    log_print(f"测试集评估结果")
+    log_print(f"{'='*60}")
+    log_print(f"  ACC1 (MAE-based): {acc1:.4f} ({acc1*100:.2f}%)")
+    log_print(f"  ACC2 (国标):      {acc2:.4f} ({acc2*100:.2f}%)")
+    log_print(f"  RMSE:             {rmse:.2f} MW")
+    log_print(f"  MAE:              {mae:.2f} MW")
+
+    num_steps = all_targets.shape[1]
+    log_print(f"\n按预测步 (每步15分钟, 共{num_steps}步):")
+    log_print(f"  {'步':>3s}  {'时刻':>7s}  {'ACC1':>7s}  {'ACC2':>7s}  {'RMSE(MW)':>9s}  {'MAE(MW)':>8s}")
+    log_print(f"  {'-'*3}  {'-'*7}  {'-'*7}  {'-'*7}  {'-'*9}  {'-'*8}")
+    for step in range(num_steps):
+        yt = all_targets[:, step:step+1]
+        yp = all_preds[:, step:step+1]
+        s_acc1 = calc_acc_mae(yt, yp, cap)
+        s_acc2 = calc_acc2(yt, yp, cap)
+        s_rmse = calc_rmse(yt, yp, cap)
+        s_mae = calc_mae(yt, yp, cap)
+        minutes = (step + 1) * 15
+        time_label = f"+{minutes}min"
+        log_print(f"  {step+1:3d}  {time_label:>7s}  {s_acc1:.4f}  {s_acc2:.4f}  {s_rmse:9.2f}  {s_mae:8.2f}")
+
+    log_print(f"{'='*60}")
 
 
-class RoPEDecoderLayer(nn.Module):
-    """
-    Transformer Decoder Layer + RoPE
-    Self-Attention + Cross-Attention + Feedforward
-    Post-LN 残差结构
-    """
+# ============== 主入口 ==============
 
-    def __init__(self, d_model: int, nhead: int,
-                 dim_feedforward: int = 1024,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.self_attn = RoPEMultiheadAttention(d_model, nhead, dropout)
-        self.cross_attn = RoPEMultiheadAttention(d_model, nhead, dropout)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
-        self.dropout4 = nn.Dropout(dropout)
-        self.activation = nn.GELU()
+def main():
+    parser = argparse.ArgumentParser(description="太阳能电站功率预测 (RoPE v2 改良版)")
 
-    def forward(
-        self,
-        tgt: torch.Tensor,                   # [B, dec_len, d_model]
-        memory: torch.Tensor,                 # [B, enc_len, d_model]
-        cos_self: torch.Tensor,               # decoder self-attn 位置
-        sin_self: torch.Tensor,
-        cos_cross_q: torch.Tensor,            # cross-attn Q 位置 (decoder 绝对位置)
-        sin_cross_q: torch.Tensor,
-        cos_cross_k: torch.Tensor,            # cross-attn K 位置 (encoder 位置)
-        sin_cross_k: torch.Tensor,
-    ) -> torch.Tensor:
-        # 1. Self-Attention (decoder 内部, 局部位置)
-        tgt2 = self.self_attn(tgt, tgt, tgt,
-                               cos_self, sin_self, cos_self, sin_self)
-        tgt = self.norm1(tgt + self.dropout1(tgt2))
+    parser.add_argument("--mode", type=str, default="all",
+                        choices=["all", "preprocess", "train", "evaluate"])
+    parser.add_argument("--csv-path", type=str,
+                        default="solar_station_1.csv",
+                        help="solar_station_1.csv 文件路径")
 
-        # 2. Cross-Attention (Q=decoder绝对位置, K=encoder位置 → 编码时间距离)
-        tgt2 = self.cross_attn(tgt, memory, memory,
-                                cos_cross_q, sin_cross_q,
-                                cos_cross_k, sin_cross_k)
-        tgt = self.norm2(tgt + self.dropout2(tgt2))
+    parser.add_argument("--epochs", type=int, default=100, help="最大训练轮次")
+    parser.add_argument("--batch-size", type=int, default=64, help="批大小")
+    parser.add_argument("--lr", type=float, default=1e-4, help="学习率")
+    parser.add_argument("--weight-decay", type=float, default=0.05, help="L2正则化系数")
+    parser.add_argument("--patience", type=int, default=10, help="Early Stopping 耐心值 (基于 ACC2)")
+    parser.add_argument("--warmup-epochs", type=int, default=5, help="Warmup 轮次")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="梯度裁剪阈值")
 
-        # 3. Feedforward
-        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
-        tgt = self.norm3(tgt + self.dropout4(tgt2))
+    parser.add_argument("--d-model", type=int, default=128, help="Transformer 隐藏层维度")
+    parser.add_argument("--nhead", type=int, default=4, help="注意力头数")
+    parser.add_argument("--num-encoder-layers", type=int, default=2, help="Encoder 层数")
+    parser.add_argument("--num-decoder-layers", type=int, default=2, help="Decoder 层数")
+    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout 比率")
 
-        return tgt
+    parser.add_argument("--lambda-mse", type=float, default=0.5, help="MSE Loss 权重")
+    parser.add_argument("--lambda-acc2", type=float, default=1, help="ACC2 Loss 权重")
 
+    parser.add_argument("--noise-std", type=float, default=0.01, help="训练时输入高斯噪声标准差 (0=关闭)")
 
-# ============== 顶层模型 ==============
+    args = parser.parse_args()
 
-class SolarTransformerRoPE(nn.Module):
-    """
-    太阳能电站功率预测 - Encoder-Decoder Transformer + RoPE
+    # 记录本次运行信息（写入最终 txt）
+    log_print("=" * 80)
+    log_print(f"Run started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log_print(f"Args: {vars(args)}")
+    log_print("=" * 80)
 
-    forward 接口与 SolarTransformer 完全一致:
-        forward(x_enc, x_dec) -> [B, 16]
+    if args.mode in ["all", "preprocess"]:
+        log_print("\n[1/3] 数据预处理")
+        preprocess_main(csv_path=args.csv_path)
 
-    Encoder 输入: [B, 96, 13]  历史 (功率+气象+时间)
-    Decoder 输入: [B, 16, 12]  未来 (气象+时间, 无功率)
-    输出:         [B, 16]      未来功率预测
-    """
+    if args.mode in ["all", "train"]:
+        log_print("\n[2/3] 模型训练")
+        train(args)
 
-    def __init__(self,
-                 enc_feat_size: int = 13,
-                 dec_feat_size: int = 12,
-                 d_model: int = 256,
-                 nhead: int = 8,
-                 num_encoder_layers: int = 4,
-                 num_decoder_layers: int = 4,
-                 dim_feedforward: int = 1024,
-                 dropout: float = 0.1,
-                 enc_seq_len: int = 96,
-                 dec_seq_len: int = 16,
-                 rope_base: float = 10000.0):
-        super().__init__()
-
-        self.d_model = d_model
-        self.nhead = nhead
-        self.enc_seq_len = enc_seq_len
-        self.dec_seq_len = dec_seq_len
-        head_dim = d_model // nhead
-
-        # --- 输入投影 ---
-        self.enc_projection = nn.Sequential(
-            nn.Linear(enc_feat_size, d_model),
-            nn.LayerNorm(d_model),
-        )
-        self.dec_projection = nn.Sequential(
-            nn.Linear(dec_feat_size, d_model),
-            nn.LayerNorm(d_model),
-        )
-
-        # --- RoPE (共享频率表, 覆盖 encoder + decoder 全长) ---
-        self.rope = RotaryPositionEncoding(
-            head_dim=head_dim,
-            max_len=enc_seq_len + dec_seq_len + 10,
-            base=rope_base,
-        )
-
-        # --- Encoder ---
-        self.encoder_layers = nn.ModuleList([
-            RoPEEncoderLayer(d_model, nhead, dim_feedforward, dropout)
-            for _ in range(num_encoder_layers)
-        ])
-        self.encoder_norm = nn.LayerNorm(d_model)
-
-        # --- Decoder ---
-        self.decoder_layers = nn.ModuleList([
-            RoPEDecoderLayer(d_model, nhead, dim_feedforward, dropout)
-            for _ in range(num_decoder_layers)
-        ])
-        self.decoder_norm = nn.LayerNorm(d_model)
-
-        # --- 输出投影 ---
-        self.output_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 1),
-        )
-
-    def forward(self, x_enc: torch.Tensor, x_dec: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x_enc: [B, enc_seq_len, enc_feat_size]  历史序列
-            x_dec: [B, dec_seq_len, dec_feat_size]  未来序列
-        Returns:
-            [B, dec_seq_len]  功率预测
-        """
-        enc_len = x_enc.size(1)
-        dec_len = x_dec.size(1)
-
-        # 1. 预计算 RoPE cos/sin
-        enc_cos, enc_sin = self.rope(enc_len, offset=0)          # [0..95]
-        dec_self_cos, dec_self_sin = self.rope(dec_len, offset=0) # [0..15] 局部位置
-        dec_cross_q_cos, dec_cross_q_sin = self.rope(dec_len, offset=enc_len)  # [96..111]
-        dec_cross_k_cos, dec_cross_k_sin = enc_cos, enc_sin      # [0..95]
-
-        # 2. Encoder
-        enc = self.enc_projection(x_enc)     # [B, 96, d_model]
-        for layer in self.encoder_layers:
-            enc = layer(enc, enc_cos, enc_sin)
-        memory = self.encoder_norm(enc)      # [B, 96, d_model]
-
-        # 3. Decoder
-        dec = self.dec_projection(x_dec)     # [B, 16, d_model]
-        for layer in self.decoder_layers:
-            dec = layer(dec, memory,
-                        dec_self_cos, dec_self_sin,
-                        dec_cross_q_cos, dec_cross_q_sin,
-                        dec_cross_k_cos, dec_cross_k_sin)
-        out = self.decoder_norm(dec)         # [B, 16, d_model]
-
-        # 4. 输出
-        pred = self.output_projection(out)   # [B, 16, 1]
-        return pred.squeeze(-1)              # [B, 16]
+    if args.mode in ["all", "evaluate"]:
+        log_print("\n[3/3] 模型评估")
+        evaluate(args)
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"设备: {device}")
-
-    model = SolarTransformerRoPE(
-        enc_feat_size=13,
-        dec_feat_size=12,
-        d_model=256,
-        nhead=8,
-        num_encoder_layers=4,
-        num_decoder_layers=4,
-        enc_seq_len=96,
-        dec_seq_len=16,
-    ).to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"参数量: {total_params:,}")
-
-    x_enc = torch.randn(4, 96, 13).to(device)
-    x_dec = torch.randn(4, 16, 12).to(device)
-    with torch.no_grad():
-        out = model(x_enc, x_dec)
-    print(f"Encoder 输入: {x_enc.shape}")
-    print(f"Decoder 输入: {x_dec.shape}")
-    print(f"输出: {out.shape}")
+    main()
