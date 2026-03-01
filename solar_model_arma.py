@@ -175,9 +175,10 @@ class ARMAModel(nn.Module):
         """
         L = past_power.shape[1]
 
-        # 取出需要的片段: 长度 = q + p
-        # 片段覆盖位置 [L-q-p, L-q-p+1, ..., L-1]
-        segment = past_power[:, L - self.q - self.p:]  # [B, q+p]
+        # 取出需要的片段: 长度 = q + p - 1
+        # unfold(size=p, step=1) 产生窗口数 = (q+p-1 - p)/1 + 1 = q  ✓
+        # 片段覆盖位置 [L-q-p, ..., L-2]，每个窗口对应一个预测时刻
+        segment = past_power[:, L - self.q - self.p : L - 1]  # [B, q+p-1]
 
         # 滑动窗口: 步长1, 窗口大小p -> [B, q, p]
         windows = segment.unfold(dimension=1, size=self.p, step=1)  # [B, q, p]
