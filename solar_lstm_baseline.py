@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
-太阳能电站功率预测 - 简单 LSTM Baseline
+太阳能电站功率预测 - 简单 LSTM Baseline (solar_station_1.csv)
 
-架构 (对比 solar_lstm_train.py Seq2Seq):
-  Seq2Seq:  Encoder LSTM (288步) + Decoder LSTM (48步, 需未来时间特征)
-  Baseline: 单 LSTM (288步) -> 取最后隐状态 -> FC -> 直接输出48步
+架构对比:
+  Seq2Seq (solar_lstm.py):
+    Encoder LSTM(96步,13feat) -> (h,c) -> Decoder LSTM(16步,12feat) -> FC -> [B,16]
+    未来天气逐步输入解码器
 
-输入: [B, 288, 7]  (时间sin/cos×3=6 + 历史功率=1)
-输出: [B, 48]      (未来 4h 每5分钟功率, 归一化)
+  Baseline (本文件):
+    LSTM(96步,13feat) -> 最后隐状态[B,H]
+                              +
+    未来天气展平[B,16*12=192]
+                              ↓
+    Concat -> FC -> [B,16]
+    未来天气一次性拼接, 无解码器
 
-归一化: 功率 / max_power  (与 solar_lstm_train.py 相同)
-.npy 数据文件: 与 solar_lstm_train.py 共用 (X_enc_*.npy, y_*.npy)
+数据: 与 solar_lstm.py 共用预处理文件 (X_enc_*.npy, X_dec_*.npy, y_*.npy, norm_params.pkl)
+      如无预处理文件, --mode all 时会自动预处理 solar_station_1.csv
 
 使用方式:
-  python solar_lstm_baseline.py                    # 完整流程 (需先有 training_data.csv)
-  python solar_lstm_baseline.py --mode train       # 仅训练 (需先预处理)
-  python solar_lstm_baseline.py --mode evaluate    # 仅评估
-  python solar_lstm_baseline.py --csv-path /path/to/training_data.csv
+  python solar_lstm_baseline.py                   # 完整流程
+  python solar_lstm_baseline.py --mode train      # 仅训练 (需先有 .npy 文件)
+  python solar_lstm_baseline.py --mode evaluate   # 仅评估
 """
 
 import os
@@ -34,28 +39,32 @@ from tqdm import tqdm
 
 
 # =====================================================================
-# 数据预处理 (与 solar_lstm_train.py 相同逻辑, 共用 norm_params_v2.pkl)
+# 数据预处理 (与 solar_lstm.py 相同逻辑, 共用 norm_params.pkl)
 # =====================================================================
 
-def preprocess(csv_path="training_data.csv", output_dir=".", in_steps=288, out_steps=48):
-    """完整预处理: 加载 -> 特征提取 -> 切序列 -> 保存 .npy"""
+def preprocess(csv_path="solar_station_1.csv", output_dir="."):
     print("=" * 60)
     print("数据预处理")
     print("=" * 60)
 
     df = pd.read_csv(csv_path)
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").reset_index(drop=True)
     print(f"原始数据: {len(df)} 条记录")
+    df["time"] = pd.to_datetime(df["time"])
 
-    # 负值置零
-    df.loc[df["generationPower"] < 0, "generationPower"] = 0.0
+    weather_cols = ["tsi", "dni", "ghi", "temp", "atm", "rh"]
+    for col in weather_cols:
+        n_bad = (df[col] == -99).sum()
+        if n_bad > 0:
+            df.loc[df[col] == -99, col] = np.nan
+    n_rh = (df["rh"] > 100).sum()
+    if n_rh > 0:
+        df.loc[df["rh"] > 100, "rh"] = np.nan
+    df[weather_cols] = df[weather_cols].interpolate(method="linear").bfill().ffill()
 
-    # 时间特征 (sin/cos 周期编码)
-    hour      = df["datetime"].dt.hour + df["datetime"].dt.minute / 60
-    month     = df["datetime"].dt.month
-    dayofyear = df["datetime"].dt.dayofyear
-
+    # 时间特征
+    hour      = df["time"].dt.hour + df["time"].dt.minute / 60
+    month     = df["time"].dt.month
+    dayofyear = df["time"].dt.dayofyear
     time_feats = np.column_stack([
         np.sin(2 * np.pi * hour / 24),
         np.cos(2 * np.pi * hour / 24),
@@ -63,56 +72,61 @@ def preprocess(csv_path="training_data.csv", output_dir=".", in_steps=288, out_s
         np.cos(2 * np.pi * (month - 1) / 12),
         np.sin(2 * np.pi * dayofyear / 365),
         np.cos(2 * np.pi * dayofyear / 365),
-    ]).astype(np.float32)   # [N, 6]
+    ]).astype(np.float32)
 
-    # 功率归一化: 用历史最大值代替标称容量
-    max_power = float(df["generationPower"].max())
-    power_normed = (df["generationPower"].values / max_power).astype(np.float32)
+    # 气象特征 Min-Max
+    norm_params = {}
+    weather_normed = []
+    for col in weather_cols:
+        vmin, vmax = float(df[col].min()), float(df[col].max())
+        norm_params[col] = {"min": vmin, "max": vmax}
+        weather_normed.append(((df[col].values - vmin) / (vmax - vmin + 1e-8)).astype(np.float32))
+    weather_feats = np.column_stack(weather_normed)
 
-    features = np.hstack([time_feats, power_normed.reshape(-1, 1)])  # [N, 7]
-    targets  = power_normed                                           # [N]
+    # 功率
+    cap = float(df["cap"].iloc[0])
+    power_normed = (df["power"].values / cap).astype(np.float32)
+    norm_params["power"] = {"cap": cap}
 
-    print(f"max_power: {max_power:.2f} W  ({max_power/1000:.2f} kW)")
-    print(f"特征维度: {features.shape[1]}")
+    dec_features = np.hstack([time_feats, weather_feats])                   # [N, 12]
+    enc_features = np.hstack([dec_features, power_normed.reshape(-1, 1)])   # [N, 13]
+    targets = power_normed
 
-    # 滑动窗口
+    print(f"特征: enc={enc_features.shape}, dec={dec_features.shape}, cap={cap} MW")
+
+    # 滑动窗口 96→16
+    in_steps, out_steps = 96, 16
     total = in_steps + out_steps
-    n = len(features) - total + 1
+    n = len(enc_features) - total + 1
 
-    X = np.lib.stride_tricks.sliding_window_view(
-        features, (total, features.shape[1])
-    )[:, 0, :in_steps, :]          # [n, in_steps, 7]
-    y = np.lib.stride_tricks.sliding_window_view(
-        targets, total
-    )[:n, in_steps:]               # [n, out_steps]
+    X_enc = np.lib.stride_tricks.sliding_window_view(
+        enc_features, (total, enc_features.shape[1])
+    )[:, 0, :in_steps, :]
+    X_dec = np.lib.stride_tricks.sliding_window_view(
+        dec_features, (total, dec_features.shape[1])
+    )[:, 0, in_steps:, :]
+    y_arr = np.lib.stride_tricks.sliding_window_view(targets, total)[:n, in_steps:]
+    X_enc = X_enc[:n].astype(np.float32)
+    X_dec = X_dec[:n].astype(np.float32)
+    y_arr = y_arr[:n].astype(np.float32)
+    print(f"序列: X_enc={X_enc.shape}, X_dec={X_dec.shape}, y={y_arr.shape}")
 
-    X = X[:n].astype(np.float32)
-    y = y[:n].astype(np.float32)
-    print(f"序列: X={X.shape}, y={y.shape}")
-
-    # 划分数据集
     train_end = int(n * 0.70)
     val_end   = int(n * 0.85)
-
     splits = {
-        "train": (X[:train_end],       y[:train_end]),
-        "val":   (X[train_end:val_end], y[train_end:val_end]),
-        "test":  (X[val_end:],          y[val_end:]),
+        "train": (X_enc[:train_end],         X_dec[:train_end],         y_arr[:train_end]),
+        "val":   (X_enc[train_end:val_end],   X_dec[train_end:val_end],  y_arr[train_end:val_end]),
+        "test":  (X_enc[val_end:],            X_dec[val_end:],           y_arr[val_end:]),
     }
     print("\n数据集划分:")
-    for name, (xi, yi) in splits.items():
-        np.save(os.path.join(output_dir, f"X_enc_{name}.npy"), xi)
-        np.save(os.path.join(output_dir, f"y_{name}.npy"),     yi)
-        print(f"  {name}: {len(xi)} 样本")
+    for name, (xe, xd, yt) in splits.items():
+        np.save(os.path.join(output_dir, f"X_enc_{name}.npy"), xe)
+        np.save(os.path.join(output_dir, f"X_dec_{name}.npy"), xd)
+        np.save(os.path.join(output_dir, f"y_{name}.npy"), yt)
+        print(f"  {name}: {len(xe)} 样本")
 
-    norm_params = {
-        "power":     {"max": max_power},
-        "in_steps":  in_steps,
-        "out_steps": out_steps,
-    }
-    with open(os.path.join(output_dir, "norm_params_v2.pkl"), "wb") as f:
+    with open(os.path.join(output_dir, "norm_params.pkl"), "wb") as f:
         pickle.dump(norm_params, f)
-
     print("预处理完成!")
 
 
@@ -131,8 +145,7 @@ def calc_acc1(y_true, y_pred, cap):
 def calc_acc2(y_true, y_pred, cap):
     p_m = y_true.flatten() * cap
     p_p = y_pred.flatten() * cap
-    denom = np.maximum(p_m, 0.2 * cap)
-    return max(0.0, 1.0 - np.sqrt(np.mean(((p_m - p_p) / denom) ** 2)))
+    return max(0.0, 1.0 - np.sqrt(np.mean(((p_m - p_p) / np.maximum(p_m, 0.2 * cap)) ** 2)))
 
 
 def calc_rmse(y_true, y_pred, cap):
@@ -143,71 +156,70 @@ def calc_mae(y_true, y_pred, cap):
     return np.mean(np.abs(y_true * cap - y_pred * cap))
 
 
-def _time_label(step_idx, step_min=5):
-    total = (step_idx + 1) * step_min
-    if total % 60 == 0:
-        return f"+{total // 60}h"
-    h, m = total // 60, total % 60
-    return f"+{h}h{m:02d}m" if h else f"+{m}min"
-
-
-def print_metrics(y_true, y_pred, max_power, out_steps=48, label="评估结果"):
-    acc1 = calc_acc1(y_true, y_pred, max_power)
-    acc2 = calc_acc2(y_true, y_pred, max_power)
-    rmse = calc_rmse(y_true, y_pred, max_power)
-    mae  = calc_mae(y_true, y_pred, max_power)
+def print_metrics(y_true, y_pred, cap, label="评估结果"):
+    acc1 = calc_acc1(y_true, y_pred, cap)
+    acc2 = calc_acc2(y_true, y_pred, cap)
+    rmse = calc_rmse(y_true, y_pred, cap)
+    mae  = calc_mae(y_true, y_pred, cap)
 
     print(f"\n{'='*60}")
     print(f"{label}")
     print(f"{'='*60}")
     print(f"  ACC1 (MAE-based): {acc1:.4f}  ({acc1*100:.2f}%)")
     print(f"  ACC2 (国标):      {acc2:.4f}  ({acc2*100:.2f}%)")
-    print(f"  RMSE:             {rmse/1000:.4f} kW  ({rmse:.2f} W)")
-    print(f"  MAE:              {mae/1000:.4f} kW  ({mae:.2f} W)")
+    print(f"  RMSE:             {rmse:.4f}  ({rmse*cap:.2f} MW)")
+    print(f"  MAE:              {mae:.4f}  ({mae*cap:.2f} MW)")
 
-    print(f"\n  按{out_steps}个预测点 (每点5分钟):")
-    for i in range(out_steps):
+    print(f"\n  按16个预测点 (每点15分钟):")
+    for i in range(16):
         yt, yp = y_true[:, i:i+1], y_pred[:, i:i+1]
-        print(f"    点{i+1:2d} ({_time_label(i):>7s}): "
-              f"ACC1={calc_acc1(yt, yp, max_power):.4f}, "
-              f"ACC2={calc_acc2(yt, yp, max_power):.4f}, "
-              f"RMSE={calc_rmse(yt, yp, max_power)/1000:.2f} kW")
+        total_min = (i + 1) * 15
+        if total_min % 60 == 0:
+            tlabel = f"+{total_min // 60}h"
+        else:
+            h, m = total_min // 60, total_min % 60
+            tlabel = f"+{h}h{m:02d}m" if h else f"+{m}min"
+        print(f"    点{i+1:2d} ({tlabel:>7s}): "
+              f"ACC1={calc_acc1(yt, yp, cap):.4f}, "
+              f"ACC2={calc_acc2(yt, yp, cap):.4f}, "
+              f"RMSE={calc_rmse(yt, yp, cap)*cap:.2f} MW")
     print(f"{'='*60}")
     return acc1, acc2, rmse, mae
 
 
 # =====================================================================
-# 模型: 简单 LSTM Baseline
+# 模型: 简单 LSTM Baseline (历史LSTM + 未来天气拼接)
 # =====================================================================
 
 class SimpleLSTM(nn.Module):
     """
-    LSTM Baseline:
-      1. LSTM 处理输入序列 [B, in_steps, feat]
-      2. 取最后时间步隐状态 [B, hidden]
-      3. 全连接层直接输出 out_steps 步预测 [B, out_steps]
+    步骤:
+      1. LSTM 处理历史序列 X_enc [B, 96, 13] -> 最后隐状态 [B, hidden]
+      2. 展平未来天气 X_dec [B, 16, 12]      -> [B, 16*12=192]
+      3. 拼接 [B, hidden+192] -> FC -> [B, 16]
     """
-    def __init__(self, input_size=7, hidden_size=128, num_layers=2,
-                 out_steps=48, dropout=0.2):
+    def __init__(self, enc_input=13, dec_flat=192, hidden_size=128,
+                 num_layers=2, out_steps=16, dropout=0.2):
         super().__init__()
         self.lstm = nn.LSTM(
-            input_size=input_size,
+            input_size=enc_input,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(hidden_size + dec_flat, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, out_steps),
         )
 
-    def forward(self, x):
-        # x: [B, in_steps, input_size]
-        out, _ = self.lstm(x)      # [B, in_steps, hidden]
-        last   = out[:, -1, :]    # [B, hidden]  取最后时间步
-        return self.fc(last)       # [B, out_steps]
+    def forward(self, x_enc, x_dec):
+        # x_enc: [B, 96, 13]  x_dec: [B, 16, 12]
+        out, _ = self.lstm(x_enc)                       # [B, 96, hidden]
+        last   = out[:, -1, :]                          # [B, hidden]
+        dec_flat = x_dec.reshape(x_dec.size(0), -1)    # [B, 16*12]
+        return self.fc(torch.cat([last, dec_flat], dim=1))  # [B, 16]
 
 
 # =====================================================================
@@ -218,33 +230,46 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"设备: {device}")
 
-    X_train = np.load("X_enc_train.npy")
-    y_train = np.load("y_train.npy")
-    X_val   = np.load("X_enc_val.npy")
-    y_val   = np.load("y_val.npy")
+    X_enc_train = np.load("X_enc_train.npy")
+    X_dec_train = np.load("X_dec_train.npy")
+    y_train     = np.load("y_train.npy")
+    X_enc_val   = np.load("X_enc_val.npy")
+    X_dec_val   = np.load("X_dec_val.npy")
+    y_val       = np.load("y_val.npy")
 
-    with open("norm_params_v2.pkl", "rb") as f:
+    with open("norm_params.pkl", "rb") as f:
         norm_params = pickle.load(f)
-    max_power = norm_params["power"]["max"]
-    out_steps = norm_params.get("out_steps", y_train.shape[1])
+    cap = norm_params["power"]["cap"]
 
-    print(f"训练集: {X_train.shape[0]} 样本, 输入={X_train.shape[1:]},"
-          f" 输出={y_train.shape[1:]}")
-    print(f"验证集: {X_val.shape[0]} 样本")
-    print(f"max_power: {max_power:.2f} W  ({max_power/1000:.2f} kW)")
+    print(f"训练集: {X_enc_train.shape[0]} 样本  "
+          f"enc={X_enc_train.shape[1:]}, dec={X_dec_train.shape[1:]}")
+    print(f"验证集: {X_enc_val.shape[0]} 样本")
+    print(f"cap: {cap} MW")
+
+    enc_input = X_enc_train.shape[2]              # 13
+    dec_flat  = X_dec_train.shape[1] * X_dec_train.shape[2]  # 16*12=192
+    out_steps = y_train.shape[1]                  # 16
 
     train_loader = DataLoader(
-        TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train)),
+        TensorDataset(
+            torch.FloatTensor(X_enc_train),
+            torch.FloatTensor(X_dec_train),
+            torch.FloatTensor(y_train),
+        ),
         batch_size=args.batch_size, shuffle=True,
     )
     val_loader = DataLoader(
-        TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val)),
+        TensorDataset(
+            torch.FloatTensor(X_enc_val),
+            torch.FloatTensor(X_dec_val),
+            torch.FloatTensor(y_val),
+        ),
         batch_size=args.batch_size, shuffle=False,
     )
 
-    feat_size = X_train.shape[2]   # 7
     model = SimpleLSTM(
-        input_size=feat_size,
+        enc_input=enc_input,
+        dec_flat=dec_flat,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
         out_steps=out_steps,
@@ -253,7 +278,8 @@ def train(args):
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\n模型参数量: {total_params:,}")
-    print(f"结构: SimpleLSTM(hidden={args.hidden_size}, layers={args.num_layers}) + FC")
+    print(f"结构: LSTM(enc={enc_input}, h={args.hidden_size}, L={args.num_layers})"
+          f" + concat(dec_flat={dec_flat}) + FC -> {out_steps}")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
@@ -275,11 +301,10 @@ def train(args):
         train_loss = 0.0
         train_bar = tqdm(train_loader, desc=f"  Ep{epoch+1:3d} 训练",
                          leave=False, unit="batch")
-        for X_b, y_b in train_bar:
-            X_b, y_b = X_b.to(device), y_b.to(device)
+        for xe, xd, yb in train_bar:
+            xe, xd, yb = xe.to(device), xd.to(device), yb.to(device)
             optimizer.zero_grad()
-            pred = model(X_b)
-            loss = criterion(pred, y_b)
+            loss = criterion(model(xe, xd), yb)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -295,23 +320,23 @@ def train(args):
         val_bar = tqdm(val_loader, desc=f"  Ep{epoch+1:3d} 验证",
                        leave=False, unit="batch")
         with torch.no_grad():
-            for X_b, y_b in val_bar:
-                X_b, y_b = X_b.to(device), y_b.to(device)
-                pred = model(X_b)
-                bvl  = criterion(pred, y_b).item()
+            for xe, xd, yb in val_bar:
+                xe, xd, yb = xe.to(device), xd.to(device), yb.to(device)
+                pred = model(xe, xd)
+                bvl  = criterion(pred, yb).item()
                 val_loss += bvl
                 val_bar.set_postfix(loss=f"{bvl:.4f}")
                 all_preds.append(pred.cpu().numpy())
-                all_trues.append(y_b.cpu().numpy())
+                all_trues.append(yb.cpu().numpy())
         val_loss /= len(val_loader)
 
         all_preds = np.concatenate(all_preds)
         all_trues = np.concatenate(all_trues)
 
-        acc1 = calc_acc1(all_trues, all_preds, max_power)
-        acc2 = calc_acc2(all_trues, all_preds, max_power)
-        rmse = calc_rmse(all_trues, all_preds, max_power)
-        mae  = calc_mae(all_trues,  all_preds, max_power)
+        acc1 = calc_acc1(all_trues, all_preds, cap)
+        acc2 = calc_acc2(all_trues, all_preds, cap)
+        rmse = calc_rmse(all_trues, all_preds, cap)
+        mae  = calc_mae(all_trues,  all_preds, cap)
         lr   = optimizer.param_groups[0]["lr"]
 
         epoch_bar.set_postfix(
@@ -321,7 +346,7 @@ def train(args):
             f"Epoch {epoch+1:3d}/{args.epochs} | LR: {lr:.6f} | "
             f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
             f"ACC1: {acc1:.4f} | ACC2: {acc2:.4f} | "
-            f"RMSE: {rmse/1000:.2f} kW | MAE: {mae/1000:.2f} kW"
+            f"RMSE: {rmse:.4f} ({rmse*cap:.2f} MW) | MAE: {mae:.4f} ({mae*cap:.2f} MW)"
         )
 
         if val_loss < best_val_loss:
@@ -355,22 +380,23 @@ def train(args):
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    X_test = np.load("X_enc_test.npy")
-    y_test = np.load("y_test.npy")
+    X_enc_test = np.load("X_enc_test.npy")
+    X_dec_test = np.load("X_dec_test.npy")
+    y_test     = np.load("y_test.npy")
 
-    with open("norm_params_v2.pkl", "rb") as f:
+    with open("norm_params.pkl", "rb") as f:
         norm_params = pickle.load(f)
-    max_power = norm_params["power"]["max"]
-    out_steps = norm_params.get("out_steps", y_test.shape[1])
+    cap = norm_params["power"]["cap"]
 
     ckpt = torch.load("lstm_baseline_ckpt/best_model.pth",
                       map_location=device, weights_only=False)
     saved = ckpt["args"]
     model = SimpleLSTM(
-        input_size=X_test.shape[2],
+        enc_input=X_enc_test.shape[2],
+        dec_flat=X_dec_test.shape[1] * X_dec_test.shape[2],
         hidden_size=saved.get("hidden_size", args.hidden_size),
         num_layers=saved.get("num_layers",  args.num_layers),
-        out_steps=out_steps,
+        out_steps=y_test.shape[1],
         dropout=saved.get("dropout", args.dropout),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -380,20 +406,24 @@ def evaluate(args):
           f"acc1={ckpt['acc1']:.4f}, acc2={ckpt['acc2']:.4f}")
 
     loader = DataLoader(
-        TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test)),
+        TensorDataset(
+            torch.FloatTensor(X_enc_test),
+            torch.FloatTensor(X_dec_test),
+            torch.FloatTensor(y_test),
+        ),
         batch_size=args.batch_size, shuffle=False,
     )
 
     all_preds, all_trues = [], []
     with torch.no_grad():
-        for X_b, y_b in tqdm(loader, desc="测试推理"):
-            all_preds.append(model(X_b.to(device)).cpu().numpy())
-            all_trues.append(y_b.numpy())
+        for xe, xd, yb in tqdm(loader, desc="测试推理"):
+            all_preds.append(model(xe.to(device), xd.to(device)).cpu().numpy())
+            all_trues.append(yb.numpy())
 
     all_preds = np.concatenate(all_preds)
     all_trues = np.concatenate(all_trues)
 
-    print_metrics(all_trues, all_preds, max_power, out_steps=out_steps,
+    print_metrics(all_trues, all_preds, cap,
                   label="测试集评估结果 (SimpleLSTM Baseline)")
 
 
@@ -402,25 +432,20 @@ def evaluate(args):
 # =====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="简单 LSTM Baseline - training_data.csv")
+    parser = argparse.ArgumentParser(description="简单 LSTM Baseline - solar_station_1.csv")
 
     parser.add_argument("--mode", type=str, default="all",
                         choices=["all", "preprocess", "train", "evaluate"])
-    parser.add_argument("--csv-path",  type=str, default="training_data.csv")
-    parser.add_argument("--in-steps",  type=int, default=288,
-                        help="输入步数 (288 = 24h @ 5min)")
-    parser.add_argument("--out-steps", type=int, default=48,
-                        help="预测步数 (48 = 4h @ 5min)")
+    parser.add_argument("--csv-path", type=str, default="solar_station_1.csv")
 
     # 训练参数
     parser.add_argument("--epochs",     type=int,   default=100)
-    parser.add_argument("--batch-size", type=int,   default=64)
+    parser.add_argument("--batch-size", type=int,   default=128)
     parser.add_argument("--lr",         type=float, default=1e-3)
     parser.add_argument("--patience",   type=int,   default=15)
 
-    # 模型结构
-    parser.add_argument("--hidden-size", type=int,   default=128,
-                        help="LSTM 隐藏层大小 (Seq2Seq 用 256, Baseline 用 128)")
+    # 模型结构 (比 Seq2Seq 更小)
+    parser.add_argument("--hidden-size", type=int,   default=128)
     parser.add_argument("--num-layers",  type=int,   default=2)
     parser.add_argument("--dropout",     type=float, default=0.2)
 
@@ -428,7 +453,7 @@ def main():
 
     if args.mode in ["all", "preprocess"]:
         print("\n[1/3] 数据预处理")
-        preprocess(csv_path=args.csv_path, in_steps=args.in_steps, out_steps=args.out_steps)
+        preprocess(csv_path=args.csv_path)
 
     if args.mode in ["all", "train"]:
         print("\n[2/3] 模型训练")
