@@ -190,8 +190,8 @@ def print_metrics(y_true, y_pred, cap, label="评估结果"):
     log_print(f"{'='*60}")
     log_print(f"  ACC1 (MAE-based): {acc1:.4f}  ({acc1*100:.2f}%)")
     log_print(f"  ACC2 (国标):      {acc2:.4f}  ({acc2*100:.2f}%)")
-    log_print(f"  RMSE:             {rmse:.4f}  ({rmse*cap:.2f} MW)")
-    log_print(f"  MAE:              {mae:.4f}  ({mae*cap:.2f} MW)")
+    log_print(f"  RMSE:             {rmse:.4f} MW")
+    log_print(f"  MAE:              {mae:.4f} MW")
 
     log_print(f"\n  按16个预测点 (每点15分钟):")
     for i in range(16):
@@ -206,7 +206,7 @@ def print_metrics(y_true, y_pred, cap, label="评估结果"):
             f"    点{i+1:2d} ({tlabel:>7s}): "
             f"ACC1={calc_acc1(yt, yp, cap):.4f}, "
             f"ACC2={calc_acc2(yt, yp, cap):.4f}, "
-            f"RMSE={calc_rmse(yt, yp, cap)*cap:.2f} MW"
+            f"RMSE={calc_rmse(yt, yp, cap):.2f} MW"
         )
     log_print(f"{'='*60}")
     return acc1, acc2, rmse, mae
