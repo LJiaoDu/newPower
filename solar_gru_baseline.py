@@ -9,14 +9,19 @@ GRU Baseline:
                           ↓
   Concat -> FC -> [B,16]
 
+Loss: 混合 Loss = λ_mse * MSE + λ_acc2 * ACC2_Loss
+  - MSE: 绝对误差, 稳定收敛
+  - ACC2 Loss: 相对误差, 与国标 ACC2 评估指标直接对齐
+
 数据: 与 solar_lstm.py / solar_lstm_baseline.py 共用预处理文件
       (X_enc_*.npy, X_dec_*.npy, y_*.npy, norm_params.pkl)
       如无预处理文件, --mode all 时会自动预处理 solar_station_1.csv
 
 使用方式:
-  python solar_gru_baseline.py                   # 完整流程
-  python solar_gru_baseline.py --mode train      # 仅训练 (需先有 .npy 文件)
-  python solar_gru_baseline.py --mode evaluate   # 仅评估
+  python solar_gru_baseline.py                                          # 完整流程
+  python solar_gru_baseline.py --mode train                             # 仅训练
+  python solar_gru_baseline.py --mode train --lambda-mse 1.0 --lambda-acc2 0.5
+  python solar_gru_baseline.py --mode evaluate                          # 仅评估
 """
 
 import os
@@ -233,6 +238,38 @@ def print_metrics(y_true, y_pred, cap, label="评估结果"):
 
 
 # =====================================================================
+# 混合 Loss
+# =====================================================================
+
+class ACC2Loss(nn.Module):
+    """
+    基于国标 ACC2 的损失函数
+    L = mean( ((pred - target) / max(target, 0.2 * cap_norm))^2 )
+    """
+    def __init__(self, cap_norm=1.0):
+        super().__init__()
+        self.cap_norm = cap_norm
+
+    def forward(self, pred, target):
+        denom = torch.clamp(target, min=0.2 * self.cap_norm)
+        return torch.mean(((pred - target) / denom) ** 2)
+
+
+class MixedLoss(nn.Module):
+    """混合 Loss = λ_mse * MSE + λ_acc2 * ACC2_Loss"""
+    def __init__(self, lambda_mse=1.0, lambda_acc2=1.0, cap_norm=1.0):
+        super().__init__()
+        self.lambda_mse  = lambda_mse
+        self.lambda_acc2 = lambda_acc2
+        self.mse_loss    = nn.MSELoss()
+        self.acc2_loss   = ACC2Loss(cap_norm=cap_norm)
+
+    def forward(self, pred, target):
+        return self.lambda_mse * self.mse_loss(pred, target) \
+             + self.lambda_acc2 * self.acc2_loss(pred, target)
+
+
+# =====================================================================
 # 模型: 简单 GRU Baseline (历史GRU + 未来天气拼接)
 # =====================================================================
 
@@ -319,7 +356,11 @@ def train(args):
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
-    criterion = nn.MSELoss()
+    criterion = MixedLoss(
+        lambda_mse=args.lambda_mse,
+        lambda_acc2=args.lambda_acc2,
+        cap_norm=1.0,  # 功率已归一化到 [0,1]
+    )
 
     os.makedirs("gru_baseline_ckpt", exist_ok=True)
 
@@ -328,6 +369,7 @@ def train(args):
 
     log_print(f"\n{'='*70}")
     log_print(f"开始训练 | Epochs={args.epochs} | BatchSize={args.batch_size} | LR={args.lr}")
+    log_print(f"Loss: MixedLoss(λ_mse={args.lambda_mse}, λ_acc2={args.lambda_acc2})")
     log_print(f"{'='*70}\n")
 
     epoch_bar = tqdm(range(args.epochs), desc="训练进度", unit="epoch")
@@ -479,6 +521,12 @@ def main():
     parser.add_argument("--hidden-size", type=int,   default=128)
     parser.add_argument("--num-layers",  type=int,   default=2)
     parser.add_argument("--dropout",     type=float, default=0.2)
+
+    # 混合 Loss 权重
+    parser.add_argument("--lambda-mse",  type=float, default=1.0,
+                        help="MSE Loss 权重")
+    parser.add_argument("--lambda-acc2", type=float, default=1.0,
+                        help="ACC2 Loss 权重 (与国标 ACC2 评估指标对齐)")
 
     args = parser.parse_args()
 
