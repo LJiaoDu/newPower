@@ -27,6 +27,10 @@ class PowerDataProcessor:
         if 'datetime' in df.columns and 'dateTime' not in df.columns:
             df.rename(columns={'datetime': 'dateTime'}, inplace=True)
 
+        # 统一功率列名（支持power或generationPower）
+        if 'power' in df.columns and 'generationPower' not in df.columns:
+            df.rename(columns={'power': 'generationPower'}, inplace=True)
+
         # 转换时间列
         if 'dateTime' in df.columns:
             # 如果是时间戳，转换为datetime
@@ -250,13 +254,22 @@ def prepare_data_for_training(data_dir='.', train_ratio=0.7, val_ratio=0.15, use
 
     # 1. 加载数据
     if use_csv is None:
-        # 自动检测
-        csv_file = os.path.join(data_dir, 'training_data.csv')
-        use_csv = os.path.exists(csv_file)
+        # 自动检测：优先使用194.csv，其次training_data.csv
+        if os.path.exists(os.path.join(data_dir, '194.csv')):
+            use_csv = True
+            _csv_filename = '194.csv'
+        elif os.path.exists(os.path.join(data_dir, 'training_data.csv')):
+            use_csv = True
+            _csv_filename = 'training_data.csv'
+        else:
+            use_csv = False
+            _csv_filename = None
+    else:
+        _csv_filename = '194.csv' if os.path.exists(os.path.join(data_dir, '194.csv')) else 'training_data.csv'
 
     if use_csv:
         print("\n=== 步骤 1: 加载CSV数据 ===")
-        df = processor.load_csv_file('training_data.csv')
+        df = processor.load_csv_file(_csv_filename)
     else:
         print("\n=== 步骤 1: 加载JSON数据 ===")
         df = processor.load_json_files()

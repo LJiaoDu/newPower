@@ -38,14 +38,21 @@ def preprocess_data():
     print("步骤 1/3: 数据预处理")
     print("="*70)
 
-    # 检查是否有JSON文件
+    # 检查是否有CSV文件或JSON文件
+    has_194_csv = os.path.exists('194.csv')
+    has_training_csv = os.path.exists('training_data.csv')
     json_files = [f for f in os.listdir('.') if f.endswith('.json')]
-    if not json_files:
-        print("错误: 未找到JSON数据文件!")
-        print("请确保当前目录包含 772_YYYY-MM-DD.json 格式的数据文件")
-        sys.exit(1)
 
-    print(f"找到 {len(json_files)} 个JSON文件")
+    if has_194_csv:
+        print("找到数据文件: 194.csv")
+    elif has_training_csv:
+        print("找到数据文件: training_data.csv")
+    elif json_files:
+        print(f"找到 {len(json_files)} 个JSON文件")
+    else:
+        print("错误: 未找到数据文件!")
+        print("请确保当前目录包含 194.csv、training_data.csv 或 772_YYYY-MM-DD.json 格式的数据文件")
+        sys.exit(1)
 
     # 运行数据预处理
     try:
