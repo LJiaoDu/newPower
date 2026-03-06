@@ -258,12 +258,14 @@ def train(args):
     best_val_loss = float("inf")
     patience_counter = 0
 
-    epoch_bar = tqdm(range(args.epochs), desc="Training", unit="epoch")
+    epoch_bar = tqdm(range(args.epochs), desc="Epochs", unit="epoch")
     for epoch in epoch_bar:
         # --- 训练 ---
         model.train()
         train_loss = 0.0
-        for batch_enc, batch_dec, batch_y in train_loader:
+        batch_bar = tqdm(train_loader, desc=f"  Train {epoch+1:3d}/{args.epochs}",
+                         leave=False, unit="batch")
+        for batch_enc, batch_dec, batch_y in batch_bar:
             batch_enc = batch_enc.to(device)
             batch_dec = batch_dec.to(device)
             batch_y   = batch_y.to(device)
@@ -279,6 +281,8 @@ def train(args):
             nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             train_loss += loss.item()
+            batch_bar.set_postfix(loss=f"{loss.item():.5f}")
+        batch_bar.close()
         train_loss /= len(train_loader)
 
         # --- 验证 ---
