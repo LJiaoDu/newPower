@@ -4,7 +4,7 @@
 
 数据特点:
   - 无气象数据 (tsi/dni/ghi/temp/atm/rh 均不存在)
-  - 时间间隔约 5 分钟 (不规则) -> 重采样到 15 分钟
+  - 时间间隔约 5 分钟 (不规则) -> 重采样到 5 分钟
   - 功率单位: 瓦 (W), 最大约 1.81MW
   - 位置: lat=22.832779, lng=108.306903 (广西南宁)
   - 时间范围: 2024-06-01 ~ 2026-03-03
@@ -20,7 +20,7 @@
     - 太阳高度角 (1): solar_elevation (预测时刻的理论值)
     - 无功率
 
-序列长度: 96步 (24h @15min) -> 16步 (4h @15min)
+序列长度: 288步 (24h @5min) -> 48步 (4h @5min)
 """
 
 import pandas as pd
@@ -239,8 +239,8 @@ def extract_features(df):
 # ============================================================
 
 def create_sequences(enc_features, dec_features, targets,
-                     in_steps=96, out_steps=16):
-    """创建滑动窗口序列 (96步@15min=24h 输入, 16步@15min=4h 预测)"""
+                     in_steps=288, out_steps=48):
+    """创建滑动窗口序列 (288步@5min=24h 输入, 48步@5min=4h 预测)"""
     X_enc_list, X_dec_list, y_list = [], [], []
     total_len = in_steps + out_steps
 
@@ -254,8 +254,8 @@ def create_sequences(enc_features, dec_features, targets,
     y = np.array(y_list, dtype=np.float32)
 
     print(f"\n序列创建完成:")
-    print(f"  Encoder 输入: {X_enc.shape}  ({in_steps}步={in_steps*15//60}h, {X_enc.shape[2]}特征)")
-    print(f"  Decoder 输入: {X_dec.shape}  ({out_steps}步={out_steps*15//60}h, {X_dec.shape[2]}特征)")
+    print(f"  Encoder 输入: {X_enc.shape}  ({in_steps}步={in_steps*5//60}h, {X_enc.shape[2]}特征)")
+    print(f"  Decoder 输入: {X_dec.shape}  ({out_steps}步={out_steps*5//60}h, {X_dec.shape[2]}特征)")
     print(f"  预测目标:     {y.shape}")
     return X_enc, X_dec, y
 
@@ -300,16 +300,16 @@ def main(csv_path="194.csv", output_dir="."):
     print("太阳能电站数据预处理 - 194.csv (天文高度角特征)")
     print("=" * 60)
 
-    # 1. 加载 & 重采样到 15min
-    df = load_and_resample(csv_path, resample_interval="15min")
+    # 1. 加载 & 重采样到 5min
+    df = load_and_resample(csv_path, resample_interval="5min")
 
     # 2. 特征提取
     enc_features, dec_features, targets, norm_params, enc_names, dec_names = \
         extract_features(df)
 
-    # 3. 创建序列 (24h 输入 -> 4h 预测)
+    # 3. 创建序列 (24h 输入 -> 4h 预测, @5min)
     X_enc, X_dec, y = create_sequences(enc_features, dec_features, targets,
-                                        in_steps=96, out_steps=16)
+                                        in_steps=288, out_steps=48)
 
     # 4. 划分并保存
     split_and_save(X_enc, X_dec, y, norm_params, enc_names, dec_names,

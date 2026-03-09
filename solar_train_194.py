@@ -426,7 +426,7 @@ def evaluate(args):
 
     # 逐步分析
     num_steps = all_targets.shape[1]
-    log_print(f"\n按预测步 (每步15分钟, 共{num_steps}步):")
+    log_print(f"\n按预测步 (每步5分钟, 共{num_steps}步):")
     log_print(f"  {'步':>3}  {'时刻':>7}  {'ACC1':>7}  {'ACC2':>7}  {'RMSE(MW)':>9}  {'MAE(MW)':>8}")
     log_print(f"  {'-'*3}  {'-'*7}  {'-'*7}  {'-'*7}  {'-'*9}  {'-'*8}")
     for step in range(num_steps):
@@ -437,7 +437,7 @@ def evaluate(args):
         s_rmse = calc_rmse(yt, yp, cap)
         s_mae  = calc_mae(yt, yp, cap)
         log_print(
-            f"  {step+1:3d}  {'+%dmin' % ((step+1)*15):>7}  "
+            f"  {step+1:3d}  {'+%dmin' % ((step+1)*5):>7}  "
             f"{s_acc1:.4f}  {s_acc2:.4f}  {s_rmse:9.4f}  {s_mae:8.4f}"
         )
     log_print(f"{'='*60}")
