@@ -240,11 +240,20 @@ def extract_features(df):
 
 def create_sequences(enc_features, dec_features, targets,
                      in_steps=288, out_steps=48):
-    """创建滑动窗口序列 (288步@5min=24h 输入, 48步@5min=4h 预测)"""
+    """创建滑动窗口序列 (288步@5min=24h 输入, 48步@5min=4h 预测)
+    过滤规则: 输出窗口内至少有 1 个时间点太阳高度角 > 0 (即有白天), 纯夜间序列丢弃.
+    """
     X_enc_list, X_dec_list, y_list = [], [], []
     total_len = in_steps + out_steps
+    # dec_features 第 6 列为 solar_elevation (归一化, >0 表示白天)
+    SOLAR_ELEV_IDX = 6
+    skipped = 0
 
     for i in range(len(enc_features) - total_len + 1):
+        out_elev = dec_features[i + in_steps : i + total_len, SOLAR_ELEV_IDX]
+        if out_elev.max() == 0:   # 输出窗口全是夜间 -> 跳过
+            skipped += 1
+            continue
         X_enc_list.append(enc_features[i : i + in_steps])
         X_dec_list.append(dec_features[i + in_steps : i + total_len])
         y_list.append(targets[i + in_steps : i + total_len])
@@ -253,7 +262,7 @@ def create_sequences(enc_features, dec_features, targets,
     X_dec = np.array(X_dec_list, dtype=np.float32)
     y = np.array(y_list, dtype=np.float32)
 
-    print(f"\n序列创建完成:")
+    print(f"\n序列创建完成 (已过滤纯夜间序列 {skipped} 条):")
     print(f"  Encoder 输入: {X_enc.shape}  ({in_steps}步={in_steps*5//60}h, {X_enc.shape[2]}特征)")
     print(f"  Decoder 输入: {X_dec.shape}  ({out_steps}步={out_steps*5//60}h, {X_dec.shape[2]}特征)")
     print(f"  预测目标:     {y.shape}")
