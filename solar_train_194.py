@@ -475,7 +475,7 @@ def main():
 
     # 混合 Loss 权重
     parser.add_argument("--lambda-mse",  type=float, default=1.0)
-    parser.add_argument("--lambda-acc2", type=float, default=1.0)
+    parser.add_argument("--lambda-acc2", type=float, default=0.5)
 
     # 数据增强
     parser.add_argument("--noise-std", type=float, default=0.01)
